@@ -1,0 +1,204 @@
+# Multilingual SIREN experiment config.
+# The loader intentionally supports multiple schemas because public safety datasets
+# frequently revise column names. If a dataset fails, inspect it with
+# scripts/inspect_hf_dataset.py and edit the field candidates below.
+
+seed: 42
+output_root: outputs/multilingual_siren
+cache_dir: null
+max_length: 512
+val_ratio_if_no_validation: 0.2
+test_ratio_if_no_test: 0.1
+balance_per_dataset: true
+max_samples_per_dataset_split: null   # set e.g. 5000 for debugging
+languages: [en, ko, fr]
+shared_min_langs: 3                  # 3 = strict intersection across en/ko/fr; 2 = majority-shared
+route_unknown_lang_to: en
+label_positive_is_unsafe: true
+
+# Keep SIREN defaults/ranges as closely as possible.
+probe:
+  c_values: [100.0, 1000.0]
+  metric: f1_macro
+  quick_eval: true
+
+mlp:
+  n_trials: 32
+  n_folds: 3
+  batch_size: 8192
+  epochs_final: 512
+  early_stopping_patience: 10
+  weight_decay: 0.0001
+  hidden_layers_min: 2
+  hidden_layers_max: 3
+  hidden_dim_min: 64
+  hidden_dim_max: 2048
+  dropout_min: 0.2
+  dropout_max: 0.5
+  lr_min: 0.0001
+  lr_max: 0.005
+
+# SIREN paper datasets. These are included mainly for English sanity checks
+# and for following SIREN's dataset selection principle: broad safety categories,
+# prompt/response harmfulness, refusal/compliance, not only hate/toxic comments.
+# For routed/plus comparison, multilingual datasets below are more important.
+datasets:
+  - name: wildguardmix_en
+    enabled: true
+    source: hf
+    hf_id: allenai/wildguardmix
+    split_map: {train: train, validation: validation, test: test}
+    lang: en
+    text_template: "{prompt}\n\n{response}"
+    text_candidates: [text, prompt, user_prompt, instruction, response]
+    label_candidates: [response_harm_label, prompt_harm_label, label, is_harmful, harmful, unsafe]
+    unsafe_values: [harmful, unsafe, Harmful, Unsafe, true, True, 1, "1", yes]
+    safe_values: [unharmful, safe, benign, Harmless, Safe, false, False, 0, "0", no]
+    category_candidates: [subcategory, risk_category, harm_category, category]
+
+  - name: toxicchat_en
+    enabled: true
+    source: hf
+    hf_id: lmsys/toxic-chat
+    split_map: {train: train, validation: null, test: test}
+    lang: en
+    text_candidates: [user_input, text, prompt]
+    label_candidates: [toxicity, toxic, label]
+    unsafe_values: [1, "1", true, True, toxic, unsafe, harmful]
+    safe_values: [0, "0", false, False, non-toxic, safe, benign]
+    category_candidates: [jailbreaking]
+
+  - name: aegis2_en
+    enabled: true
+    source: hf
+    hf_id: nvidia/Aegis-AI-Content-Safety-Dataset-2.0
+    split_map: {train: train, validation: validation, test: test}
+    lang: en
+    text_candidates: [text, prompt, user_prompt, instruction]
+    response_candidates: [response, assistant_response, completion]
+    text_template: "{text}\n\n{response}"
+    label_candidates: [response_label, prompt_label, label, safety_label, moderation_label]
+    unsafe_values: [unsafe, Unsafe, harmful, Harmful, 1, "1", true, True]
+    safe_values: [safe, Safe, benign, harmless, 0, "0", false, False]
+    category_candidates: [categories, category, risk_type, violated_categories]
+
+  - name: aegis1_en
+    enabled: false
+    source: hf
+    hf_id: nvidia/Aegis-AI-Content-Safety-Dataset-1.0
+    split_map: {train: train, validation: validation, test: test}
+    lang: en
+    text_candidates: [text, prompt, user_prompt, instruction]
+    response_candidates: [response, assistant_response, completion]
+    text_template: "{text}\n\n{response}"
+    label_candidates: [response_label, prompt_label, label, safety_label, moderation_label]
+    unsafe_values: [unsafe, Unsafe, harmful, Harmful, 1, "1", true, True]
+    safe_values: [safe, Safe, benign, harmless, 0, "0", false, False]
+    category_candidates: [categories, category, risk_type, violated_categories]
+
+  - name: beavertails_en
+    enabled: true
+    source: hf
+    hf_id: PKU-Alignment/BeaverTails
+    split_map: {train: 330k_train, validation: null, test: 30k_test}
+    lang: en
+    text_template: "{prompt}\n\n{response}"
+    text_candidates: [prompt, text, question]
+    response_candidates: [response, answer, output]
+    label_candidates: [is_safe, safe, label]
+    # is_safe=True means safe, so reverse mapping is handled here.
+    unsafe_values: [false, False, 0, "0", unsafe, harmful]
+    safe_values: [true, True, 1, "1", safe, harmless]
+    category_candidates: [category, safety_category]
+
+  - name: pku_saferlhf_en
+    enabled: true
+    source: hf
+    hf_id: PKU-Alignment/PKU-SafeRLHF
+    split_map: {train: train, validation: null, test: test}
+    lang: en
+    # This dataset often contains two responses per prompt. The loader can expand response_0/response_1
+    # if paired_response_mode=true.
+    paired_response_mode: true
+    text_candidates: [prompt, text, question]
+    response0_candidates: [response_0, answer_0]
+    response1_candidates: [response_1, answer_1]
+    label0_candidates: [is_response_0_safe, response_0_safe]
+    label1_candidates: [is_response_1_safe, response_1_safe]
+    unsafe_values: [false, False, 0, "0", unsafe, harmful]
+    safe_values: [true, True, 1, "1", safe, harmless]
+    category_candidates: [category, safety_category]
+
+  # Multilingual datasets. These are the main datasets for routed/plus comparison.
+  - name: linguasafe_multi
+    enabled: true
+    source: hf
+    hf_id: zhiyuan-ning/linguasafe
+    split_map: {train: train, validation: validation, test: test}
+    lang_candidates: [language, lang, locale]
+    keep_langs: [en, ko, fr]
+    text_candidates: [prompt, query, instruction, text, input]
+    response_candidates: [response, answer, output]
+    text_template: "{text}\n\n{response}"
+    label_candidates: [label, safety_label, is_safe, unsafe, severity, risk_level]
+    unsafe_values: [unsafe, harmful, high, medium, severe, 1, "1", 2, "2", 3, "3", true, True]
+    safe_values: [safe, harmless, benign, none, low, 0, "0", false, False]
+    category_candidates: [domain, subtype, category, risk_category]
+
+  - name: lumees_multi
+    enabled: true
+    source: hf
+    hf_id: lumees/multilingual-safety-classification-dataset
+    split_map: {train: train, validation: validation, test: test}
+    lang_candidates: [language, lang, locale]
+    keep_langs: [en, ko, fr]
+    text_candidates: [prompt, query, instruction, text, input]
+    response_candidates: [response, answer, output]
+    text_template: "{text}\n\n{response}"
+    label_candidates: [label, safety_label, unsafe, is_unsafe, is_safe]
+    unsafe_values: [unsafe, harmful, 1, "1", true, True]
+    safe_values: [safe, harmless, benign, 0, "0", false, False]
+    category_candidates: [category, risk_category, type]
+
+  - name: wildguardmix_ko_test
+    enabled: true
+    source: hf
+    hf_id: iknow-lab/wildguardmix-test-ko
+    split_map: {train: train, validation: null, test: test}
+    lang: ko
+    text_template: "{prompt}\n\n{response}"
+    text_candidates: [prompt, ko_prompt, text, user_prompt]
+    response_candidates: [response, ko_response, assistant_response]
+    label_candidates: [response_harm_label, prompt_harm_label, label, is_harmful, harmful, unsafe]
+    unsafe_values: [harmful, unsafe, Harmful, Unsafe, true, True, 1, "1"]
+    safe_values: [unharmful, safe, benign, Harmless, Safe, false, False, 0, "0"]
+    category_candidates: [subcategory, risk_category, harm_category, category]
+
+  # XSafety is often distributed through GitHub rather than HF. Convert it to local JSONL/CSV
+  # with columns: text,label,lang,category and set enabled=true.
+  - name: xsafety_local
+    enabled: false
+    source: local
+    path: data/xsafety_en_ko_fr.jsonl
+    split_map: {train: train, validation: validation, test: test}
+    lang_candidates: [lang, language]
+    keep_langs: [en, ko, fr]
+    text_candidates: [text, prompt, query]
+    label_candidates: [label, unsafe, is_unsafe]
+    unsafe_values: [unsafe, harmful, 1, "1", true, True]
+    safe_values: [safe, harmless, 0, "0", false, False]
+    category_candidates: [category, task, risk_category]
+
+  # M-ALERT mainly helps en/fr. Use after converting to local JSONL/CSV if needed.
+  - name: malert_local
+    enabled: false
+    source: local
+    path: data/malert_en_fr.jsonl
+    split_map: {train: train, validation: validation, test: test}
+    lang_candidates: [lang, language]
+    keep_langs: [en, fr]
+    text_candidates: [text, prompt, query]
+    label_candidates: [label, unsafe, is_unsafe]
+    unsafe_values: [unsafe, harmful, 1, "1", true, True]
+    safe_values: [safe, harmless, 0, "0", false, False]
+    category_candidates: [category, risk_category]
