@@ -148,25 +148,24 @@ datasets:
     enabled: true
     source: hf
     hf_id: zhiyuan-ning/linguasafe
-    # HF currently redirects telegraphpolehead/linguasafe to zhiyuan-ning/linguasafe.
-    # The public page is gated/sensitive, so the schema validator should be used on the runtime machine.
-    split_map: {train: train, validation: null, test: test}
-    lang_candidates: [language, lang, locale]
+    # LinguaSafe's official evaluator loads split="train" only. Its binary label is
+    # derived from severity level: level=0 is safe/oversensitivity probe, level>0 is unsafe.
+    # The dataset covers English and Korean, but not French, so it is an auxiliary en/ko source.
+    split_map: {train: train, validation: null, test: null}
+    lang_candidates: [lang, language, locale]
     keep_langs: [en, ko, fr]
     text_candidates: [prompt, query, instruction, text, input]
-    response_candidates: [response, answer, output]
-    text_template: "{text}\n\n{response}"
-    label_candidates: [label, safety_label, is_safe, unsafe, severity, risk_level]
-    # For severity/risk labels, anything above 0 is treated as unsafe in this binary setup.
-    unsafe_values: [unsafe, harmful, high, medium, severe, 1, "1", 2, "2", 3, "3", true, True]
-    safe_values: [safe, harmless, benign, none, low, 0, "0", false, False]
-    category_candidates: [domain, subtype, category, risk_category, safety_domain]
+    label_candidates: [level, severity, risk_level, label, safety_label, is_safe, unsafe]
+    unsafe_values: [1, "1", 2, "2", 3, "3", unsafe, harmful, high, medium, severe, true, True]
+    safe_values: [0, "0", safe, harmless, benign, none, low, false, False]
+    category_candidates: [subtype, domain, category, risk_category, safety_domain]
 
   - name: lumees_multi
     enabled: true
     source: hf
     hf_id: lumees/multilingual-safety-classification-dataset
-    split_map: {train: train, validation: null, test: test}
+    # HF currently exposes only a train split; train is split locally into train/validation/test.
+    split_map: {train: train, validation: null, test: null}
     lang_candidates: [lang, language, locale]
     keep_langs: [en, ko, fr]
     text_candidates: [prompt, query, instruction, text, input]
