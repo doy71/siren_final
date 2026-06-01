@@ -92,13 +92,30 @@ def infer_lang(row: Dict[str, Any], spec: Dict[str, Any]) -> Optional[str]:
     return norm_lang(value)
 
 
-def infer_category(row: Dict[str, Any], spec: Dict[str, Any]) -> Optional[str]:
-    _, value = first_present(row, spec.get("category_candidates", []))
+def stringify_category(value: Any) -> Optional[str]:
     if value is None:
         return None
+    if isinstance(value, dict):
+        active = [str(k) for k, v in value.items() if bool(v)]
+        if active:
+            return ";".join(active)
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
     if isinstance(value, list):
         return ";".join(map(str, value))
     return str(value)
+
+
+def infer_category(row: Dict[str, Any], spec: Dict[str, Any]) -> Optional[str]:
+    _, value = first_present(row, spec.get("category_candidates", []))
+    return stringify_category(value)
+
+
+def infer_paired_category(row: Dict[str, Any], spec: Dict[str, Any], idx: int) -> Optional[str]:
+    candidates = spec.get(f"response{idx}_category_candidates", [])
+    _, value = first_present(row, candidates)
+    if value is None:
+        return infer_category(row, spec)
+    return stringify_category(value)
 
 
 def iter_rows_from_hf(spec: Dict[str, Any], split: str, cache_dir: Optional[str] = None) -> Iterable[Dict[str, Any]]:
@@ -156,6 +173,11 @@ def normalize_paired_saferlhf_row(row: Dict[str, Any], spec: Dict[str, Any], sou
         if prompt is None or resp is None or label is None:
             continue
         lang = infer_lang(row, spec)
+        if lang is None:
+            continue
+        keep_langs = spec.get("keep_langs")
+        if keep_langs and lang not in {norm_lang(x) for x in keep_langs}:
+            continue
         text = f"{prompt}\n\n{resp}".strip()
         out.append({
             "text": text,
@@ -164,7 +186,7 @@ def normalize_paired_saferlhf_row(row: Dict[str, Any], spec: Dict[str, Any], sou
             "source_dataset": source_name,
             "source_split": split_name,
             "source_id": f"{row_id}_{idx}",
-            "category": infer_category(row, spec),
+            "category": infer_paired_category(row, spec, idx),
         })
     return out
 
@@ -189,17 +211,78 @@ def normalize_row(row: Dict[str, Any], spec: Dict[str, Any], source_name: str, s
     }
 
 
+def stratify_arg(df: pd.DataFrame):
+    if len(df) == 0 or "label" not in df or "lang" not in df:
+        return None
+    strat = df["label"].astype(str) + "_" + df["lang"].astype(str)
+    return strat if strat.value_counts().min() >= 2 else None
+
+
+def stratified_train_test_split(df: pd.DataFrame, test_size: float, seed: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if len(df) == 0:
+        return df.copy(), df.copy()
+    if len(df) < 2 or test_size <= 0.0:
+        return df.reset_index(drop=True), df.iloc[0:0].copy().reset_index(drop=True)
+    test_size = min(max(float(test_size), 1.0 / len(df)), 0.5 if len(df) < 10 else 0.9)
+    a, b = train_test_split(df, test_size=test_size, random_state=seed, stratify=stratify_arg(df))
+    return a.reset_index(drop=True), b.reset_index(drop=True)
+
+
 def split_dataframe(df: pd.DataFrame, val_ratio: float, test_ratio: float, seed: int) -> Dict[str, pd.DataFrame]:
     if len(df) == 0:
         return {"train": df, "validation": df, "test": df}
-    strat = df["label"].astype(str) + "_" + df["lang"].astype(str)
-    strat_arg = strat if strat.value_counts().min() >= 2 else None
-    train_val, test = train_test_split(df, test_size=test_ratio, random_state=seed, stratify=strat_arg)
-    strat2 = train_val["label"].astype(str) + "_" + train_val["lang"].astype(str)
-    strat2_arg = strat2 if strat2.value_counts().min() >= 2 else None
+    train_val, test = stratified_train_test_split(df, test_ratio, seed)
     val_size = val_ratio / max(1e-9, 1.0 - test_ratio)
-    train, val = train_test_split(train_val, test_size=val_size, random_state=seed, stratify=strat2_arg)
+    train, val = stratified_train_test_split(train_val, val_size, seed)
     return {"train": train.reset_index(drop=True), "validation": val.reset_index(drop=True), "test": test.reset_index(drop=True)}
+
+
+def complete_missing_splits(per_dataset_rows: Dict[str, List[Dict[str, Any]]], val_ratio: float, test_ratio: float, seed: int) -> Dict[str, List[Dict[str, Any]]]:
+    """Create missing validation/test splits without unnecessarily reshuffling existing held-out splits.
+
+    Previous versions merged train/validation/test and re-split whenever either
+    validation or test was missing. That could leak an explicit HF test split back
+    into training. This function only splits the available train split when
+    possible. If a dataset provides only validation/test, it falls back to a
+    deterministic train/validation/test split over the available rows.
+    """
+    n_train = len(per_dataset_rows.get("train", []))
+    n_val = len(per_dataset_rows.get("validation", []))
+    n_test = len(per_dataset_rows.get("test", []))
+    if n_train == 0:
+        base_rows = []
+        for s in ["train", "validation", "test"]:
+            base_rows.extend(per_dataset_rows.get(s, []))
+        if not base_rows:
+            return per_dataset_rows
+        df = pd.DataFrame(base_rows).drop_duplicates(subset=["text", "label", "lang"])
+        split_dfs = split_dataframe(df, val_ratio, test_ratio, seed)
+        return {k: v.to_dict(orient="records") for k, v in split_dfs.items()}
+
+    if n_val > 0 and n_test > 0:
+        return per_dataset_rows
+
+    train_df = pd.DataFrame(per_dataset_rows["train"]).drop_duplicates(subset=["text", "label", "lang"])
+    if n_val == 0 and n_test == 0:
+        split_dfs = split_dataframe(train_df, val_ratio, test_ratio, seed)
+        per_dataset_rows["train"] = split_dfs["train"].to_dict(orient="records")
+        per_dataset_rows["validation"] = split_dfs["validation"].to_dict(orient="records")
+        per_dataset_rows["test"] = split_dfs["test"].to_dict(orient="records")
+        return per_dataset_rows
+
+    if n_val == 0:
+        train_df, val_df = stratified_train_test_split(train_df, val_ratio, seed)
+        per_dataset_rows["train"] = train_df.to_dict(orient="records")
+        per_dataset_rows["validation"] = val_df.to_dict(orient="records")
+        return per_dataset_rows
+
+    if n_test == 0:
+        train_df, test_df = stratified_train_test_split(train_df, test_ratio, seed)
+        per_dataset_rows["train"] = train_df.to_dict(orient="records")
+        per_dataset_rows["test"] = test_df.to_dict(orient="records")
+        return per_dataset_rows
+
+    return per_dataset_rows
 
 
 def maybe_balance(df: pd.DataFrame, seed: int, by: List[str]) -> pd.DataFrame:
@@ -252,15 +335,9 @@ def build_normalized_dataset(config: Dict[str, Any], skip_failed: bool = True) -
                 continue
             raise
 
-        # If a dataset has no explicit validation/test, split its train split.
-        if len(per_dataset_rows["validation"]) == 0 or len(per_dataset_rows["test"]) == 0:
-            base_rows = []
-            for s in ["train", "validation", "test"]:
-                base_rows.extend(per_dataset_rows[s])
-            if len(base_rows) > 0:
-                df = pd.DataFrame(base_rows).drop_duplicates(subset=["text", "label", "lang"])
-                split_dfs = split_dataframe(df, val_ratio, test_ratio, seed)
-                per_dataset_rows = {k: v.to_dict(orient="records") for k, v in split_dfs.items()}
+        # Create missing validation/test splits. Keep explicit held-out splits intact whenever possible.
+        if len(per_dataset_rows["validation"]) == 0 or len(per_dataset_rows["test"]) == 0 or len(per_dataset_rows["train"]) == 0:
+            per_dataset_rows = complete_missing_splits(per_dataset_rows, val_ratio, test_ratio, seed)
 
         for split, rows in per_dataset_rows.items():
             all_by_split[split].extend(rows)

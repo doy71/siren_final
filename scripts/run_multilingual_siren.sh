@@ -11,6 +11,15 @@ SEEDS=${SEEDS:-42}
 POOLING_TYPES=${POOLING_TYPES:-"residual_mean mlp_mean"}
 THRESHOLDS=${THRESHOLDS:-"0.6 0.8"}
 METHODS=${METHODS:-"siren_original shared_only routed_shared_specific shared_plus_all_specific random_same_size_as_routed random_same_size_as_plus"}
+VALIDATE_DATASETS=${VALIDATE_DATASETS:-1}
+SCHEMA_CHECK_OUT=${SCHEMA_CHECK_OUT:-"outputs/multilingual_siren/_dataset_schema_check"}
+
+if [[ "${VALIDATE_DATASETS}" == "1" ]]; then
+  python scripts/validate_dataset_schemas.py \
+    --config "${CONFIG}" \
+    --out_dir "${SCHEMA_CHECK_OUT}" \
+    --fail_on_error
+fi
 
 python train/train_multilingual_siren_selection.py \
   --config "${CONFIG}" \

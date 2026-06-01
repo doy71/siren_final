@@ -1,7 +1,8 @@
 # Multilingual SIREN experiment config.
-# The loader intentionally supports multiple schemas because public safety datasets
-# frequently revise column names. If a dataset fails, inspect it with
-# scripts/inspect_hf_dataset.py and edit the field candidates below.
+# Updated to match the currently documented Hugging Face dataset IDs/configs/splits/schemas.
+# Before the expensive representation/probe/MLP run, scripts/run_multilingual_siren.sh
+# now runs scripts/validate_dataset_schemas.py and fails early if an enabled dataset
+# cannot be loaded or normalized.
 
 seed: 42
 output_root: outputs/multilingual_siren
@@ -16,7 +17,6 @@ shared_min_langs: 3                  # 3 = strict intersection across en/ko/fr; 
 route_unknown_lang_to: en
 label_positive_is_unsafe: true
 
-# Keep SIREN defaults/ranges as closely as possible.
 probe:
   c_values: [100.0, 1000.0]
   metric: f1_macro
@@ -38,19 +38,42 @@ mlp:
   lr_min: 0.0001
   lr_max: 0.005
 
-# SIREN paper datasets. These are included mainly for English sanity checks
-# and for following SIREN's dataset selection principle: broad safety categories,
-# prompt/response harmfulness, refusal/compliance, not only hate/toxic comments.
-# For routed/plus comparison, multilingual datasets below are more important.
+# Notes:
+# - WildGuardMix is gated on HF. Accept the AI2 Responsible Use Guidelines first.
+# - ToxicChat has multiple HF configs; use the latest documented toxicchat0124 config.
+# - Lumees has train/test only; validation is created from train by the loader.
+# - iknow-lab/wildguardmix-test-ko has test only; train/validation are created from that split.
+# - LinguaSafe currently contains en/ko but not fr according to the paper language table,
+#   so it is useful as an auxiliary multilingual safety dataset, not as the sole en/ko/fr source.
 datasets:
-  - name: wildguardmix_en
+  # -----------------------------
+  # English / SIREN-style safety sources
+  # -----------------------------
+  - name: wildguardmix_train_en
     enabled: true
     source: hf
     hf_id: allenai/wildguardmix
-    split_map: {train: train, validation: validation, test: test}
+    hf_name: wildguardtrain
+    split_map: {train: train, validation: null, test: null}
     lang: en
     text_template: "{prompt}\n\n{response}"
-    text_candidates: [text, prompt, user_prompt, instruction, response]
+    text_candidates: [prompt, text, user_prompt, instruction]
+    response_candidates: [response, assistant_response, completion]
+    label_candidates: [response_harm_label, prompt_harm_label, label, is_harmful, harmful, unsafe]
+    unsafe_values: [harmful, unsafe, Harmful, Unsafe, true, True, 1, "1", yes]
+    safe_values: [unharmful, safe, benign, Harmless, Safe, false, False, 0, "0", no]
+    category_candidates: [subcategory, risk_category, harm_category, category]
+
+  - name: wildguardmix_test_en
+    enabled: true
+    source: hf
+    hf_id: allenai/wildguardmix
+    hf_name: wildguardtest
+    split_map: {train: null, validation: null, test: test}
+    lang: en
+    text_template: "{prompt}\n\n{response}"
+    text_candidates: [prompt, text, user_prompt, instruction]
+    response_candidates: [response, assistant_response, completion]
     label_candidates: [response_harm_label, prompt_harm_label, label, is_harmful, harmful, unsafe]
     unsafe_values: [harmful, unsafe, Harmful, Unsafe, true, True, 1, "1", yes]
     safe_values: [unharmful, safe, benign, Harmless, Safe, false, False, 0, "0", no]
@@ -60,9 +83,11 @@ datasets:
     enabled: true
     source: hf
     hf_id: lmsys/toxic-chat
+    hf_name: toxicchat0124
     split_map: {train: train, validation: null, test: test}
     lang: en
-    text_candidates: [user_input, text, prompt]
+    text_candidates: [user_input, prompt, text]
+    response_candidates: [model_output, response, answer, output]
     label_candidates: [toxicity, toxic, label]
     unsafe_values: [1, "1", true, True, toxic, unsafe, harmful]
     safe_values: [0, "0", false, False, non-toxic, safe, benign]
@@ -74,27 +99,13 @@ datasets:
     hf_id: nvidia/Aegis-AI-Content-Safety-Dataset-2.0
     split_map: {train: train, validation: validation, test: test}
     lang: en
-    text_candidates: [text, prompt, user_prompt, instruction]
+    text_template: "{prompt}\n\n{response}"
+    text_candidates: [prompt, text, user_prompt, instruction]
     response_candidates: [response, assistant_response, completion]
-    text_template: "{text}\n\n{response}"
     label_candidates: [response_label, prompt_label, label, safety_label, moderation_label]
     unsafe_values: [unsafe, Unsafe, harmful, Harmful, 1, "1", true, True]
     safe_values: [safe, Safe, benign, harmless, 0, "0", false, False]
-    category_candidates: [categories, category, risk_type, violated_categories]
-
-  - name: aegis1_en
-    enabled: false
-    source: hf
-    hf_id: nvidia/Aegis-AI-Content-Safety-Dataset-1.0
-    split_map: {train: train, validation: validation, test: test}
-    lang: en
-    text_candidates: [text, prompt, user_prompt, instruction]
-    response_candidates: [response, assistant_response, completion]
-    text_template: "{text}\n\n{response}"
-    label_candidates: [response_label, prompt_label, label, safety_label, moderation_label]
-    unsafe_values: [unsafe, Unsafe, harmful, Harmful, 1, "1", true, True]
-    safe_values: [safe, Safe, benign, harmless, 0, "0", false, False]
-    category_candidates: [categories, category, risk_type, violated_categories]
+    category_candidates: [violated_categories, categories, category, risk_type]
 
   - name: beavertails_en
     enabled: true
@@ -115,56 +126,62 @@ datasets:
     enabled: true
     source: hf
     hf_id: PKU-Alignment/PKU-SafeRLHF
+    # default config is used. Other available configs include alpaca-7b/alpaca2-7b/alpaca3-8b.
     split_map: {train: train, validation: null, test: test}
     lang: en
-    # This dataset often contains two responses per prompt. The loader can expand response_0/response_1
-    # if paired_response_mode=true.
     paired_response_mode: true
     text_candidates: [prompt, text, question]
     response0_candidates: [response_0, answer_0]
     response1_candidates: [response_1, answer_1]
     label0_candidates: [is_response_0_safe, response_0_safe]
     label1_candidates: [is_response_1_safe, response_1_safe]
+    response0_category_candidates: [response_0_harm_category, response_0_severity_level]
+    response1_category_candidates: [response_1_harm_category, response_1_severity_level]
     unsafe_values: [false, False, 0, "0", unsafe, harmful]
     safe_values: [true, True, 1, "1", safe, harmless]
     category_candidates: [category, safety_category]
 
-  # Multilingual datasets. These are the main datasets for routed/plus comparison.
+  # -----------------------------
+  # Multilingual safety sources
+  # -----------------------------
   - name: linguasafe_multi
     enabled: true
     source: hf
     hf_id: zhiyuan-ning/linguasafe
-    split_map: {train: train, validation: validation, test: test}
+    # HF currently redirects telegraphpolehead/linguasafe to zhiyuan-ning/linguasafe.
+    # The public page is gated/sensitive, so the schema validator should be used on the runtime machine.
+    split_map: {train: train, validation: null, test: test}
     lang_candidates: [language, lang, locale]
     keep_langs: [en, ko, fr]
     text_candidates: [prompt, query, instruction, text, input]
     response_candidates: [response, answer, output]
     text_template: "{text}\n\n{response}"
     label_candidates: [label, safety_label, is_safe, unsafe, severity, risk_level]
+    # For severity/risk labels, anything above 0 is treated as unsafe in this binary setup.
     unsafe_values: [unsafe, harmful, high, medium, severe, 1, "1", 2, "2", 3, "3", true, True]
     safe_values: [safe, harmless, benign, none, low, 0, "0", false, False]
-    category_candidates: [domain, subtype, category, risk_category]
+    category_candidates: [domain, subtype, category, risk_category, safety_domain]
 
   - name: lumees_multi
     enabled: true
     source: hf
     hf_id: lumees/multilingual-safety-classification-dataset
-    split_map: {train: train, validation: validation, test: test}
-    lang_candidates: [language, lang, locale]
+    split_map: {train: train, validation: null, test: test}
+    lang_candidates: [lang, language, locale]
     keep_langs: [en, ko, fr]
     text_candidates: [prompt, query, instruction, text, input]
-    response_candidates: [response, answer, output]
-    text_template: "{text}\n\n{response}"
-    label_candidates: [label, safety_label, unsafe, is_unsafe, is_safe]
-    unsafe_values: [unsafe, harmful, 1, "1", true, True]
-    safe_values: [safe, harmless, benign, 0, "0", false, False]
+    label_candidates: [safety_label, label, unsafe, is_unsafe, is_safe]
+    # Lumees: safety_label 0=safe, 1=needs review, 2=unsafe.
+    # For binary safety-neuron selection, 1 and 2 are treated as unsafe/non-safe.
+    unsafe_values: [1, "1", 2, "2", unsafe, harmful, needs_review, review, true, True]
+    safe_values: [0, "0", safe, harmless, benign, false, False]
     category_candidates: [category, risk_category, type]
 
   - name: wildguardmix_ko_test
     enabled: true
     source: hf
     hf_id: iknow-lab/wildguardmix-test-ko
-    split_map: {train: train, validation: null, test: test}
+    split_map: {train: null, validation: null, test: test}
     lang: ko
     text_template: "{prompt}\n\n{response}"
     text_candidates: [prompt, ko_prompt, text, user_prompt]
