@@ -1,41 +1,70 @@
 import json
 import os
-import re
-from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 
 
 LANG_ALIASES = {
-    "english": "en", "eng": "en", "en-us": "en", "en_usa": "en",
-    "korean": "ko", "kor": "ko", "kr": "ko",
-    "french": "fr", "fra": "fr", "fre": "fr", "fr-fr": "fr",
+    # ISO / English names
+    "english": "en", "eng": "en", "en": "en", "en-us": "en", "en_usa": "en",
+    "korean": "ko", "kor": "ko", "ko": "ko", "kr": "ko",
+    "french": "fr", "fra": "fr", "fre": "fr", "fr": "fr", "fr-fr": "fr",
+    "german": "de", "deu": "de", "ger": "de", "de": "de",
+    "spanish": "es", "spa": "es", "es": "es",
+    "hindi": "hi", "hin": "hi", "hi": "hi",
+    "japanese": "ja", "jpn": "ja", "ja": "ja", "jp": "ja",
+    "chinese": "zh", "mandarin": "zh", "zho": "zh", "cmn": "zh", "zh": "zh", "zh-cn": "zh", "zh-tw": "zh",
+    "arabic": "ar", "arb": "ar", "ara": "ar", "ar": "ar",
+    "thai": "th", "tha": "th", "th": "th",
+    "dutch": "nl", "nld": "nl", "dut": "nl", "nl": "nl",
+    "italian": "it", "ita": "it", "it": "it",
+    # FLORES/NLLB-style language_script codes used by many multilingual datasets
+    "eng_latn": "en", "fra_latn": "fr", "kor_hang": "ko", "jpn_jpan": "ja",
+    "zho_hans": "zh", "zho_hant": "zh", "cmn_hans": "zh", "hin_deva": "hi",
+    "deu_latn": "de", "spa_latn": "es", "arb_arab": "ar", "ara_arab": "ar",
+    "tha_thai": "th", "nld_latn": "nl", "ita_latn": "it",
+}
+
+PREFIX_ALIASES = {
+    "eng": "en", "fra": "fr", "fre": "fr", "kor": "ko", "jpn": "ja", "zho": "zh", "cmn": "zh",
+    "hin": "hi", "deu": "de", "ger": "de", "spa": "es", "arb": "ar", "ara": "ar",
+    "tha": "th", "nld": "nl", "dut": "nl", "ita": "it",
 }
 
 
 def norm_lang(x: Any) -> Optional[str]:
     if x is None:
         return None
-    s = str(x).strip().lower().replace("_", "-")
-    return LANG_ALIASES.get(s, s[:2] if len(s) >= 2 else s)
+    s = str(x).strip()
+    if not s:
+        return None
+    key = s.lower().replace("-", "_").replace(" ", "_")
+    if key in LANG_ALIASES:
+        return LANG_ALIASES[key]
+    if "_" in key:
+        prefix = key.split("_")[0]
+        if prefix in PREFIX_ALIASES:
+            return PREFIX_ALIASES[prefix]
+    return key[:2] if len(key) >= 2 else key
 
 
 def as_bool_label(value: Any, unsafe_values: Iterable[Any], safe_values: Iterable[Any]) -> Optional[int]:
-    """Return 1 for unsafe/harmful, 0 for safe, None if unknown."""
+    """Return 1 for unsafe/harmful and 0 for safe. Return None if unknown/drop."""
     if value is None:
         return None
     unsafe_set = {str(v).strip().lower() for v in unsafe_values}
     safe_set = {str(v).strip().lower() for v in safe_values}
     s = str(value).strip().lower()
+    if s in {"", "none", "null", "nan"}:
+        return None
     if s in unsafe_set:
         return 1
     if s in safe_set:
         return 0
-    # handle numeric severity/risk strings robustly
     try:
         f = float(s)
         if str(int(f)) in unsafe_set:
@@ -65,7 +94,6 @@ def format_text(row: Dict[str, Any], spec: Dict[str, Any]) -> Optional[str]:
     _, response = first_present(row, response_candidates)
 
     if template:
-        # Provide both canonical placeholders and raw row keys.
         fmt = dict(row)
         fmt.setdefault("text", text or "")
         fmt.setdefault("prompt", text or "")
@@ -121,10 +149,7 @@ def infer_paired_category(row: Dict[str, Any], spec: Dict[str, Any], idx: int) -
 def iter_rows_from_hf(spec: Dict[str, Any], split: str, cache_dir: Optional[str] = None) -> Iterable[Dict[str, Any]]:
     hf_id = spec["hf_id"]
     hf_name = spec.get("hf_name")
-    if hf_name:
-        ds = load_dataset(hf_id, hf_name, split=split, cache_dir=cache_dir)
-    else:
-        ds = load_dataset(hf_id, split=split, cache_dir=cache_dir)
+    ds = load_dataset(hf_id, hf_name, split=split, cache_dir=cache_dir) if hf_name else load_dataset(hf_id, split=split, cache_dir=cache_dir)
     for r in ds:
         yield dict(r)
 
@@ -138,7 +163,7 @@ def iter_rows_from_local(spec: Dict[str, Any], split: Optional[str]) -> Iterable
             for line in f:
                 if line.strip():
                     row = json.loads(line)
-                    if split is None or row.get("split") == split:
+                    if split is None or row.get("split") in (None, split):
                         yield row
     elif path.endswith(".json"):
         with open(path, "r", encoding="utf-8") as f:
@@ -156,7 +181,7 @@ def iter_rows_from_local(spec: Dict[str, Any], split: Optional[str]) -> Iterable
     elif path.endswith(".csv"):
         df = pd.read_csv(path)
         if split is not None and "split" in df.columns:
-            df = df[df["split"] == split]
+            df = df[(df["split"].isna()) | (df["split"] == split)]
         for row in df.to_dict(orient="records"):
             yield row
     else:
@@ -238,14 +263,6 @@ def split_dataframe(df: pd.DataFrame, val_ratio: float, test_ratio: float, seed:
 
 
 def complete_missing_splits(per_dataset_rows: Dict[str, List[Dict[str, Any]]], val_ratio: float, test_ratio: float, seed: int) -> Dict[str, List[Dict[str, Any]]]:
-    """Create missing validation/test splits without unnecessarily reshuffling existing held-out splits.
-
-    Previous versions merged train/validation/test and re-split whenever either
-    validation or test was missing. That could leak an explicit HF test split back
-    into training. This function only splits the available train split when
-    possible. If a dataset provides only validation/test, it falls back to a
-    deterministic train/validation/test split over the available rows.
-    """
     n_train = len(per_dataset_rows.get("train", []))
     n_val = len(per_dataset_rows.get("validation", []))
     n_test = len(per_dataset_rows.get("test", []))
@@ -258,10 +275,8 @@ def complete_missing_splits(per_dataset_rows: Dict[str, List[Dict[str, Any]]], v
         df = pd.DataFrame(base_rows).drop_duplicates(subset=["text", "label", "lang"])
         split_dfs = split_dataframe(df, val_ratio, test_ratio, seed)
         return {k: v.to_dict(orient="records") for k, v in split_dfs.items()}
-
     if n_val > 0 and n_test > 0:
         return per_dataset_rows
-
     train_df = pd.DataFrame(per_dataset_rows["train"]).drop_duplicates(subset=["text", "label", "lang"])
     if n_val == 0 and n_test == 0:
         split_dfs = split_dataframe(train_df, val_ratio, test_ratio, seed)
@@ -269,26 +284,20 @@ def complete_missing_splits(per_dataset_rows: Dict[str, List[Dict[str, Any]]], v
         per_dataset_rows["validation"] = split_dfs["validation"].to_dict(orient="records")
         per_dataset_rows["test"] = split_dfs["test"].to_dict(orient="records")
         return per_dataset_rows
-
     if n_val == 0:
         train_df, val_df = stratified_train_test_split(train_df, val_ratio, seed)
         per_dataset_rows["train"] = train_df.to_dict(orient="records")
         per_dataset_rows["validation"] = val_df.to_dict(orient="records")
         return per_dataset_rows
-
     if n_test == 0:
         train_df, test_df = stratified_train_test_split(train_df, test_ratio, seed)
         per_dataset_rows["train"] = train_df.to_dict(orient="records")
         per_dataset_rows["test"] = test_df.to_dict(orient="records")
         return per_dataset_rows
-
     return per_dataset_rows
 
 
 def maybe_balance(df: pd.DataFrame, seed: int, by: List[str]) -> pd.DataFrame:
-    # Backward-compatible old behavior: downsample every group to the smallest group.
-    # Use only for debugging / SIREN official reproduction.
-    # For multilingual experiments use sample_by_group(strategy="cap").
     return sample_by_group(df=df, seed=seed, by=by, strategy="balance_min")
 
 
@@ -301,47 +310,25 @@ def sample_by_group(
     max_n: Optional[int] = None,
     drop_below_min: bool = False,
 ) -> pd.DataFrame:
-    """Group-aware sampling without accidental dataset collapse.
-
-    strategy:
-      "none"        – no resampling (optional drop_below_min filter only).
-      "balance_min" – downsample every group to the smallest group (original behavior).
-      "cap"         – keep all groups but cap large ones to max_n; optionally drop
-                      groups with fewer than min_n samples.
-
-    Recommended:
-      Official SIREN reproduction : strategy="none"
-      Multilingual experiments    : strategy="cap", drop_below_min=True
-    """
+    """Group-aware sampling without accidental dataset collapse."""
     if len(df) == 0:
         return df
-
     by = [c for c in by if c in df.columns]
     if not by:
         return df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-
     rng = np.random.default_rng(seed)
     strategy = str(strategy or "none").lower()
-
     if strategy == "balance_min":
-        # Use default dropna=True to match original maybe_balance behaviour
-        # (NaN-valued group keys are excluded, not treated as a separate group).
         groups = [g for _, g in df.groupby(by)]
         if not groups:
             return df
         min_group_n = min(len(g) for g in groups)
         if min_group_n <= 0:
-            # Original behaviour: return df unchanged when any group is empty.
             return df
-        sampled = [
-            g.sample(n=min_group_n, random_state=int(rng.integers(0, 1_000_000)))
-            for g in groups
-        ]
+        sampled = [g.sample(n=min_group_n, random_state=int(rng.integers(0, 1_000_000))) for g in groups]
         return pd.concat(sampled, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-
     if strategy not in {"none", "cap"}:
         raise ValueError(f"Unknown sampling_strategy={strategy!r}; expected none/balance_min/cap")
-
     groups = []
     dropped = []
     for key, g in df.groupby(by, dropna=False):
@@ -352,13 +339,10 @@ def sample_by_group(
         if strategy == "cap" and max_n is not None and len(g) > int(max_n):
             g = g.sample(n=int(max_n), random_state=int(rng.integers(0, 1_000_000)))
         groups.append(g)
-
     if dropped:
         print(f"[SAMPLE] dropped {len(dropped)} small groups below min_n={min_n}. Examples: {dropped[:10]}")
-
     if not groups:
         return df.iloc[0:0].copy()
-
     return pd.concat(groups, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
 
@@ -369,8 +353,7 @@ def build_normalized_dataset(config: Dict[str, Any], skip_failed: bool = True) -
     val_ratio = float(config.get("val_ratio_if_no_validation", 0.2))
     test_ratio = float(config.get("test_ratio_if_no_test", 0.1))
     max_per_split = config.get("max_samples_per_dataset_split")
-    sampling_strategy = str(config.get("sampling_strategy",
-        "balance_min" if config.get("balance_per_dataset", False) else "none"))
+    sampling_strategy = str(config.get("sampling_strategy", "balance_min" if config.get("balance_per_dataset", False) else "none"))
     sampling_by = list(config.get("sampling_by", ["source_dataset", "lang", "label"]))
     min_samples_per_group = config.get("min_samples_per_group")
     max_samples_per_group = config.get("max_samples_per_group")
@@ -403,11 +386,8 @@ def build_normalized_dataset(config: Dict[str, Any], skip_failed: bool = True) -
                 print(f"[WARN] failed loading {source_name}: {type(e).__name__}: {e}")
                 continue
             raise
-
-        # Create missing validation/test splits. Keep explicit held-out splits intact whenever possible.
         if len(per_dataset_rows["validation"]) == 0 or len(per_dataset_rows["test"]) == 0 or len(per_dataset_rows["train"]) == 0:
             per_dataset_rows = complete_missing_splits(per_dataset_rows, val_ratio, test_ratio, seed)
-
         for split, rows in per_dataset_rows.items():
             all_by_split[split].extend(rows)
             print(f"Loaded {source_name:28s} {split:10s}: {len(rows):7d}")
@@ -423,10 +403,6 @@ def build_normalized_dataset(config: Dict[str, Any], skip_failed: bool = True) -
         if languages:
             keep = {norm_lang(x) for x in languages}
             df = df[df["lang"].isin(keep)]
-        # Sampling policy.
-        # Old behavior: balance_per_dataset=True downsampled all (source_dataset, lang, label)
-        # groups to the smallest group, which could collapse a large multilingual run to ~50
-        # samples if one language/label group was tiny.  New default for v2 configs: strategy="cap".
         strategy = "balance_min" if config.get("balance_per_dataset", False) else sampling_strategy
         if strategy != "none" or drop_groups_below_min_n:
             df = sample_by_group(
