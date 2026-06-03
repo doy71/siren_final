@@ -1,0 +1,63 @@
+# External validation set for Nemotron-primary multilingual SIREN experiments.
+# This config is intentionally evaluation-only. Do not use it as the primary training config.
+
+seed: 42
+output_root: outputs/lumees_external_validation
+cache_dir: null
+max_length: 512
+val_ratio_if_no_validation: 0.2
+test_ratio_if_no_test: 0.1
+
+languages: [en, fr, ko, ja, zh, hi]
+shared_min_langs: 6
+route_unknown_lang_to: en
+label_positive_is_unsafe: true
+
+balance_per_dataset: false
+sampling_strategy: cap
+sampling_by: [source_dataset, lang, label]
+drop_groups_below_min_n: true
+min_samples_per_group: 500
+max_samples_per_group: 5000
+max_samples_per_dataset_split: null
+
+probe:
+  c_values: [200.0, 500.0, 1000.0]
+  metric: f1_macro
+
+mlp:
+  n_trials: 1
+  n_folds: 2
+  batch_size: 8192
+  epochs_final: 1
+  early_stopping_patience: 1
+  weight_decay: 0.0001
+  hidden_layers_min: 2
+  hidden_layers_max: 3
+  hidden_dim_min: 64
+  hidden_dim_max: 2048
+  dropout_min: 0.2
+  dropout_max: 0.5
+  lr_min: 0.0001
+  lr_max: 0.005
+
+latency:
+  repeats: 5
+  warmup: 2
+  batch_size: 2048
+  max_samples: 5000
+
+datasets:
+  - name: lumees_external
+    enabled: true
+    source: hf
+    hf_id: lumees/multilingual-safety-classification-dataset
+    split_map: {train: train, validation: null, test: null}
+    lang_candidates: [lang, language, locale]
+    keep_langs: [en, fr, ko, ja, zh, hi]
+    text_candidates: [prompt, query, instruction, text, input]
+    label_candidates: [safety_label, label, unsafe, is_unsafe, is_safe]
+    # Lumees: 0=safe, 1=needs review, 2=unsafe. Treat 1/2 as non-safe.
+    unsafe_values: [1, "1", 2, "2", unsafe, harmful, needs_review, review, true, True]
+    safe_values: [0, "0", safe, harmless, benign, false, False]
+    category_candidates: [category, risk_category, type]
