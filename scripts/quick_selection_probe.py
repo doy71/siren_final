@@ -221,15 +221,16 @@ def main() -> None:
 
     for pooling_type in args.pooling_types:
         hidden_size_by_layer = infer_hidden_size_by_layer(all_reps["train"]["representations"], pooling_type, num_layers)
+        eps_weight_ratio = float(config.get("probe", {}).get("eps_weight_ratio", 0.0))
         for threshold in args.thresholds:
-            global_sel = selected_global(global_probes, pooling_type, threshold, num_layers)
-            lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers)
+            global_sel = selected_global(global_probes, pooling_type, threshold, num_layers, eps_weight_ratio)
+            lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers, eps_weight_ratio)
 
             selection_rows.extend(summarize_selected_dict(global_sel, hidden_size_by_layer, "global", threshold, pooling_type, None))
             for lang in languages:
                 selection_rows.extend(summarize_selected_dict(lang_sel.get(lang, {}), hidden_size_by_layer, "language", threshold, pooling_type, lang))
 
-            debug = collect_selection_debug(global_probes, lang_probes, languages, pooling_type, threshold, num_layers)
+            debug = collect_selection_debug(global_probes, lang_probes, languages, pooling_type, threshold, num_layers, eps_weight_ratio)
             debug_frames.append(flatten_selection_debug(debug, threshold, pooling_type))
 
             for method in args.methods:

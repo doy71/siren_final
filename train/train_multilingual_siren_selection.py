@@ -408,6 +408,8 @@ def select_salient_neurons(
     probe: LinearProbe,
     threshold: float,
     eps_weight_ratio: float = 0.0,
+    debug_name: str = "",
+    warn_large_ratio: bool = True,
 ) -> List[int]:
     """Select neurons by cumulative absolute importance (matches SIREN paper).
 
@@ -419,6 +421,9 @@ def select_salient_neurons(
                           Practical range: 1e-3–1e-2 when using Adam+softL1 probes
                           (CSSLab SIREN) to prune the near-zero tail that inflates
                           selection counts.  Set via probe.eps_weight_ratio in config.
+        debug_name:       Human-readable probe identifier printed in large-selection
+                          warnings, e.g. "global layer=12 pooling=residual_mean".
+        warn_large_ratio: Whether to print a warning when selected/hidden > 50%.
 
     NOTE: CSSLab LinearProbe uses Adam + soft L1 (not sklearn exact-L1), so weights
     rarely reach exactly 0.  This means selection ratios can be high even at threshold=0.9.
@@ -448,9 +453,10 @@ def select_salient_neurons(
 
     # Warn when selection is diffuse — indicates flat soft-L1 weight distribution.
     hidden = len(weights)
-    if hidden > 0 and len(selected) / hidden > 0.5:
+    if warn_large_ratio and hidden > 0 and len(selected) / hidden > 0.5:
+        prefix = f"{debug_name}: " if debug_name else ""
         print(
-            f"  [WARN-SEL] selected {len(selected)}/{hidden} neurons "
+            f"  [WARN-SEL] {prefix}selected {len(selected)}/{hidden} neurons "
             f"({len(selected)/hidden:.1%}) at threshold={threshold}. "
             "Soft-L1 probe weights are diffuse. "
             "Consider probe.eps_weight_ratio: 1e-3 in config, or lower probe.c_values."
@@ -512,7 +518,10 @@ def collect_selection_debug(
         key = probe_key(layer_idx, pooling_type)
         if key in global_probes:
             probe = global_probes[key]["probe"]
-            selected = select_salient_neurons(probe, threshold, eps_weight_ratio)
+            selected = select_salient_neurons(
+                probe, threshold, eps_weight_ratio,
+                debug_name=f"global layer={layer_idx} pooling={pooling_type}",
+            )
             out["global"][str(layer_idx)] = selection_debug_stats(probe, selected)
     for lang in languages:
         out["language"][str(lang)] = {}
@@ -521,7 +530,10 @@ def collect_selection_debug(
             key = probe_key(layer_idx, pooling_type)
             if key in probes:
                 probe = probes[key]["probe"]
-                selected = select_salient_neurons(probe, threshold, eps_weight_ratio)
+                selected = select_salient_neurons(
+                    probe, threshold, eps_weight_ratio,
+                    debug_name=f"lang={lang} layer={layer_idx} pooling={pooling_type}",
+                )
                 out["language"][str(lang)][str(layer_idx)] = selection_debug_stats(probe, selected)
     return out
 
@@ -553,7 +565,10 @@ def selected_by_language(
         for layer_idx in range(num_layers):
             key = probe_key(layer_idx, pooling_type)
             if key in probes:
-                out[lang][layer_idx] = select_salient_neurons(probes[key]["probe"], threshold, eps_weight_ratio)
+                out[lang][layer_idx] = select_salient_neurons(
+                    probes[key]["probe"], threshold, eps_weight_ratio,
+                    debug_name=f"lang={lang} layer={layer_idx} pooling={pooling_type}",
+                )
             else:
                 out[lang][layer_idx] = []
     return out
@@ -570,7 +585,10 @@ def selected_global(
     for layer_idx in range(num_layers):
         key = probe_key(layer_idx, pooling_type)
         out[layer_idx] = (
-            select_salient_neurons(global_probes[key]["probe"], threshold, eps_weight_ratio)
+            select_salient_neurons(
+                global_probes[key]["probe"], threshold, eps_weight_ratio,
+                debug_name=f"global layer={layer_idx} pooling={pooling_type}",
+            )
             if key in global_probes else []
         )
     return out
@@ -1015,8 +1033,17 @@ def run_method(
     # Set probe.eps_weight_ratio: 1e-3 in config when selection ratios are >50%.
     eps_weight_ratio = float(config.get("probe", {}).get("eps_weight_ratio", 0.0))
 
-    global_sel = selected_global(global_probes, pooling_type, threshold, num_layers, eps_weight_ratio)
-    lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers, eps_weight_ratio)
+    print(f"\n[SELECT] {method} threshold={threshold} pooling={pooling_type} seed={seed}")
+
+    # Compute only the selection sets required by the current method.
+    # This prevents siren_original logs from being polluted by language-probe warnings
+    # and avoids unnecessary language-selection work when reproducing the original SIREN baseline.
+    if method == "siren_original":
+        global_sel = selected_global(global_probes, pooling_type, threshold, num_layers, eps_weight_ratio)
+        lang_sel = {}
+    else:
+        global_sel = {}
+        lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers, eps_weight_ratio)
     hidden_size_by_layer = infer_hidden_size_by_layer(all_reps["train"]["representations"], pooling_type, num_layers)
     features = build_feature_manifest(
         method, global_sel, lang_sel, languages, pooling_type, num_layers, hidden_size_by_layer,
