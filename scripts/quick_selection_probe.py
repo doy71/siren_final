@@ -96,6 +96,8 @@ def main() -> None:
     p.add_argument("--no_drop_small_groups", action="store_true")
     p.add_argument("--c_values", nargs="+", type=float, default=None)
     p.add_argument("--n_c_values", type=int, default=None, help="Use only the first N C values for faster dry runs.")
+    p.add_argument("--eps_weight_ratio", type=float, default=0.0,
+                   help="Pre-filter near-zero probe weights (0=off; try 1e-3 for soft-L1 probes).")
     args = p.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -117,6 +119,10 @@ def main() -> None:
     if args.n_c_values is not None:
         c_values = c_values[: int(args.n_c_values)]
     config["probe"]["c_values"] = [float(c) for c in c_values]
+    # Propagate eps_weight_ratio into config so selection functions pick it up.
+    if args.eps_weight_ratio != 0.0:
+        config["probe"]["eps_weight_ratio"] = float(args.eps_weight_ratio)
+    eps_weight_ratio = float(config.get("probe", {}).get("eps_weight_ratio", 0.0))
 
     seed = int(config.get("seed", 42))
     set_seed(seed)
@@ -173,13 +179,13 @@ def main() -> None:
     for pooling_type in args.pooling_types:
         hidden_size_by_layer = infer_hidden_size_by_layer(all_reps["train"]["representations"], pooling_type, num_layers)
         for threshold in args.thresholds:
-            global_sel = selected_global(global_probes, pooling_type, threshold, num_layers)
-            lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers)
+            global_sel = selected_global(global_probes, pooling_type, threshold, num_layers, eps_weight_ratio)
+            lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers, eps_weight_ratio)
             selection_rows.extend(summarize_selected_dict(global_sel, hidden_size_by_layer, "global", threshold, pooling_type, None))
             for lang in languages:
                 selection_rows.extend(summarize_selected_dict(lang_sel.get(lang, {}), hidden_size_by_layer, "language", threshold, pooling_type, lang))
 
-            debug = collect_selection_debug(global_probes, lang_probes, languages, pooling_type, threshold, num_layers)
+            debug = collect_selection_debug(global_probes, lang_probes, languages, pooling_type, threshold, num_layers, eps_weight_ratio)
             debug_frames.append(flatten_selection_debug(debug, threshold, pooling_type))
 
             for method in args.methods:

@@ -21,6 +21,11 @@ probe:
   c_values: [100.0, 1000.0]
   metric: f1_macro
   quick_eval: true
+  # eps_weight_ratio: pre-filter near-zero probe weights before cumulative selection.
+  # 0.0 = disabled (default).  Set to 1e-3 if selection ratios are consistently >50%
+  # (symptom: soft-L1/Adam probe does not drive weights to exact zero, causing diffuse
+  # importance distribution).  Check quick_selection_debug.csv → selected_ratio column.
+  eps_weight_ratio: 0.0
 
 mlp:
   n_trials: 32

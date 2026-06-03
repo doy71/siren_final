@@ -27,7 +27,13 @@ def flatten_debug(path: str):
 
     rows = []
     run_dir = Path(path).parent
-    parts = {p.split("=")[0]: p.split("=")[1] for p in run_dir.parts if "=" in p}
+    # BUG FIX: use partition("=") instead of split("=")[1] so that path components
+    # containing multiple "=" signs (e.g. base64-encoded values) are handled correctly.
+    parts = {}
+    for p in run_dir.parts:
+        if "=" in p:
+            k, _, v = p.partition("=")
+            parts[k] = v
 
     for layer, stats in (data.get("selection_debug", {}).get("global") or {}).items():
         r = dict(stats)

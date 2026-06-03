@@ -334,6 +334,10 @@ def train_all_probes(
         "pooling_types": sorted(pooling_types),
         "c_values": [float(c) for c in c_values],
         "metric": metric,
+        # BUG FIX: include languages so cache is invalidated when language set changes.
+        # Without this, adding/removing a language silently reuses stale lang probes,
+        # causing shared_by_layer to be computed over the wrong language set.
+        "languages": sorted([str(l) for l in languages]),
         "dataset_signature": dataset_signature_from_reps(all_reps),
     }
     if os.path.exists(global_path) and os.path.exists(lang_path) and not force_retrain:
@@ -400,14 +404,38 @@ def train_all_probes(
     return global_probes, lang_probes
 
 
-def select_salient_neurons(probe: LinearProbe, threshold: float) -> List[int]:
-    # Cumulative absolute probe-weight importance — matches SIREN paper.
-    # NOTE: CSSLab LinearProbe uses Adam + soft L1 (not sklearn exact-L1), so weights
-    # rarely reach exactly 0.  This means selection ratios can be high even at threshold=0.9.
-    # Use selection_debug_stats() to inspect the weight distribution.
-    weights = probe.get_feature_importance()
+def select_salient_neurons(
+    probe: LinearProbe,
+    threshold: float,
+    eps_weight_ratio: float = 0.0,
+) -> List[int]:
+    """Select neurons by cumulative absolute importance (matches SIREN paper).
+
+    Args:
+        probe:            Trained LinearProbe with get_feature_importance().
+        threshold:        Cumulative-importance fraction to cover (0–1).
+        eps_weight_ratio: Pre-filter: zero out weights < eps_weight_ratio * max_weight
+                          before the cumsum.  0.0 = no filtering (default).
+                          Practical range: 1e-3–1e-2 when using Adam+softL1 probes
+                          (CSSLab SIREN) to prune the near-zero tail that inflates
+                          selection counts.  Set via probe.eps_weight_ratio in config.
+
+    NOTE: CSSLab LinearProbe uses Adam + soft L1 (not sklearn exact-L1), so weights
+    rarely reach exactly 0.  This means selection ratios can be high even at threshold=0.9.
+    Use selection_debug_stats() to inspect the weight distribution.
+    """
+    # BUG FIX: take absolute values — comment said "absolute" but didn't call abs().
+    # Signed weights (possible with Adam+softL1) cause incorrect total and sorted order.
+    weights = np.abs(np.asarray(probe.get_feature_importance(), dtype=np.float64))
+
+    # Optional: pre-filter near-zero weights (soft-L1 artifact mitigation).
+    if eps_weight_ratio > 0.0:
+        max_w = float(weights.max())
+        if max_w > 0.0:
+            weights = np.where(weights < eps_weight_ratio * max_w, 0.0, weights)
+
     total = float(np.sum(weights))
-    if total <= 0:
+    if total <= 0.0:
         return []
     sorted_idx = np.argsort(weights)[::-1]
     selected = []
@@ -417,6 +445,16 @@ def select_salient_neurons(probe: LinearProbe, threshold: float) -> List[int]:
         csum += float(weights[idx])
         if csum >= threshold * total:
             break
+
+    # Warn when selection is diffuse — indicates flat soft-L1 weight distribution.
+    hidden = len(weights)
+    if hidden > 0 and len(selected) / hidden > 0.5:
+        print(
+            f"  [WARN-SEL] selected {len(selected)}/{hidden} neurons "
+            f"({len(selected)/hidden:.1%}) at threshold={threshold}. "
+            "Soft-L1 probe weights are diffuse. "
+            "Consider probe.eps_weight_ratio: 1e-3 in config, or lower probe.c_values."
+        )
     return selected
 
 
@@ -429,7 +467,8 @@ def selection_debug_stats(probe: LinearProbe, selected: Sequence[int]) -> Dict[s
                          ~0.5 the weight distribution is very flat (soft-L1 artifact).
       nonzero_gt_1e_6 – neurons above 1e-6 importance; closer to hidden_size = flat.
     """
-    w = np.asarray(probe.get_feature_importance(), dtype=np.float64)
+    # BUG FIX: take abs for consistency with select_salient_neurons.
+    w = np.abs(np.asarray(probe.get_feature_importance(), dtype=np.float64))
     total = float(w.sum())
     sw = np.sort(w)[::-1]
     hidden = int(len(w))
@@ -466,13 +505,14 @@ def collect_selection_debug(
     pooling_type: str,
     threshold: float,
     num_layers: int,
+    eps_weight_ratio: float = 0.0,
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {"global": {}, "language": {}}
     for layer_idx in range(num_layers):
         key = probe_key(layer_idx, pooling_type)
         if key in global_probes:
             probe = global_probes[key]["probe"]
-            selected = select_salient_neurons(probe, threshold)
+            selected = select_salient_neurons(probe, threshold, eps_weight_ratio)
             out["global"][str(layer_idx)] = selection_debug_stats(probe, selected)
     for lang in languages:
         out["language"][str(lang)] = {}
@@ -481,7 +521,7 @@ def collect_selection_debug(
             key = probe_key(layer_idx, pooling_type)
             if key in probes:
                 probe = probes[key]["probe"]
-                selected = select_salient_neurons(probe, threshold)
+                selected = select_salient_neurons(probe, threshold, eps_weight_ratio)
                 out["language"][str(lang)][str(layer_idx)] = selection_debug_stats(probe, selected)
     return out
 
@@ -500,8 +540,12 @@ def get_layer_weights(global_probes: Dict[str, Any], pooling_type: str, num_laye
 
 
 def selected_by_language(
-    lang_probes: Dict[str, Dict[str, Any]], languages: Sequence[str], pooling_type: str,
-    threshold: float, num_layers: int,
+    lang_probes: Dict[str, Dict[str, Any]],
+    languages: Sequence[str],
+    pooling_type: str,
+    threshold: float,
+    num_layers: int,
+    eps_weight_ratio: float = 0.0,
 ) -> Dict[str, Dict[int, List[int]]]:
     out = {lang: {} for lang in languages}
     for lang in languages:
@@ -509,17 +553,26 @@ def selected_by_language(
         for layer_idx in range(num_layers):
             key = probe_key(layer_idx, pooling_type)
             if key in probes:
-                out[lang][layer_idx] = select_salient_neurons(probes[key]["probe"], threshold)
+                out[lang][layer_idx] = select_salient_neurons(probes[key]["probe"], threshold, eps_weight_ratio)
             else:
                 out[lang][layer_idx] = []
     return out
 
 
-def selected_global(global_probes: Dict[str, Any], pooling_type: str, threshold: float, num_layers: int) -> Dict[int, List[int]]:
+def selected_global(
+    global_probes: Dict[str, Any],
+    pooling_type: str,
+    threshold: float,
+    num_layers: int,
+    eps_weight_ratio: float = 0.0,
+) -> Dict[int, List[int]]:
     out = {}
     for layer_idx in range(num_layers):
         key = probe_key(layer_idx, pooling_type)
-        out[layer_idx] = select_salient_neurons(global_probes[key]["probe"], threshold) if key in global_probes else []
+        out[layer_idx] = (
+            select_salient_neurons(global_probes[key]["probe"], threshold, eps_weight_ratio)
+            if key in global_probes else []
+        )
     return out
 
 
@@ -626,6 +679,9 @@ def build_feature_manifest(
 
 
 def infer_hidden_size_by_layer(representations: List[Any], pooling_type: str, num_layers: int) -> Dict[int, int]:
+    # BUG FIX: guard against empty representations list (e.g. a language with 0 samples).
+    if not representations:
+        return {layer: 0 for layer in range(num_layers)}
     sample = representations[0]
     return {layer: int(len(sample[layer][pooling_type])) for layer in range(num_layers)}
 
@@ -751,8 +807,10 @@ def predict_scores(model: nn.Module, X: np.ndarray, device: torch.device, batch_
     use_cuda_amp = device.type == "cuda"
     with torch.no_grad():
         for i in range(0, len(X), batch_size):
-            bx = torch.FloatTensor(X[i:i + batch_size]).to(device)
-            with torch.amp.autocast("cuda", enabled=use_cuda_amp):
+            # BUG FIX: create tensor directly on target device (avoids CPU→GPU copy overhead).
+            bx = torch.tensor(X[i:i + batch_size], dtype=torch.float32, device=device)
+            # BUG FIX: use device.type instead of hardcoded "cuda" (safe on CPU-only machines).
+            with torch.amp.autocast(device.type, enabled=use_cuda_amp):
                 logits = model(bx)
                 prob = torch.softmax(logits, dim=1)[:, 1]
             scores.extend(prob.detach().cpu().numpy().tolist())
@@ -770,7 +828,9 @@ def train_model(
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
     use_cuda_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda_amp)
+    # BUG FIX: use device.type instead of hardcoded "cuda" — avoids GradScaler
+    # initialisation error on CPU-only machines (PyTorch 2.1+).
+    scaler = torch.amp.GradScaler(device.type, enabled=use_cuda_amp)
     best_val_f1, best_state, patience_counter = 0.0, None, 0
     iterator = tqdm(range(epochs), desc="train mlp") if show_progress else range(epochs)
     for epoch in iterator:
@@ -778,10 +838,12 @@ def train_model(
         indices = torch.randperm(len(X_train))
         for start in range(0, len(X_train), batch_size):
             idx = indices[start:start + batch_size]
-            bx = torch.FloatTensor(X_train[idx]).to(device)
-            by = torch.LongTensor(y_train[idx]).to(device)
+            # BUG FIX: create tensors directly on device (avoids redundant CPU allocation).
+            bx = torch.tensor(X_train[idx], dtype=torch.float32, device=device)
+            by = torch.tensor(y_train[idx], dtype=torch.long, device=device)
             optimizer.zero_grad()
-            with torch.amp.autocast("cuda", enabled=use_cuda_amp):
+            # BUG FIX: device-aware autocast (safe on CPU-only machines).
+            with torch.amp.autocast(device.type, enabled=use_cuda_amp):
                 loss = criterion(model(bx), by)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -916,8 +978,13 @@ def run_method(
     languages = [str(x) for x in config.get("languages", sorted(set(all_reps["train"]["langs"])))]
     num_layers = int(all_reps["train"]["num_layers"])
     layer_weights = get_layer_weights(global_probes, pooling_type, num_layers)
-    global_sel = selected_global(global_probes, pooling_type, threshold, num_layers)
-    lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers)
+
+    # Read eps_weight_ratio from config for neuron selection denoising.
+    # Set probe.eps_weight_ratio: 1e-3 in config when selection ratios are >50%.
+    eps_weight_ratio = float(config.get("probe", {}).get("eps_weight_ratio", 0.0))
+
+    global_sel = selected_global(global_probes, pooling_type, threshold, num_layers, eps_weight_ratio)
+    lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers, eps_weight_ratio)
     hidden_size_by_layer = infer_hidden_size_by_layer(all_reps["train"]["representations"], pooling_type, num_layers)
     features = build_feature_manifest(
         method, global_sel, lang_sel, languages, pooling_type, num_layers, hidden_size_by_layer,
@@ -926,6 +993,16 @@ def run_method(
     if len(features) == 0:
         print(f"[WARN] no features selected for {method} threshold={threshold} pooling={pooling_type}; skip")
         return
+
+    # Warn when total feature dimension is very large — MLP training will be slow/OOM.
+    total_neurons = sum(hidden_size_by_layer.values())
+    if total_neurons > 0 and len(features) > 0.5 * total_neurons:
+        print(
+            f"[WARN-DIM] {method} threshold={threshold}: {len(features)} features "
+            f"= {len(features)/total_neurons:.1%} of total neuron budget ({total_neurons}). "
+            "High selection ratio detected. "
+            "Consider probe.eps_weight_ratio or lower probe.c_values to reduce feature count."
+        )
 
     run_dir = os.path.join(out_dir, f"method={method}", f"threshold={threshold}", f"pooling={pooling_type}", f"seed={seed}")
     os.makedirs(run_dir, exist_ok=True)
@@ -1023,7 +1100,8 @@ def run_method(
         "shared_min_langs": int(config.get("shared_min_langs", len(languages))),
         "active_feature_counts": active_feature_counts(features, languages),
         "selection_debug": collect_selection_debug(
-            global_probes, lang_probes, languages, pooling_type, threshold, num_layers
+            global_probes, lang_probes, languages, pooling_type, threshold, num_layers,
+            eps_weight_ratio,
         ),
     }
     with open(os.path.join(run_dir, "selected_neurons.json"), "w", encoding="utf-8") as f:
