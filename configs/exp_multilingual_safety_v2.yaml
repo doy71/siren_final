@@ -1,0 +1,122 @@
+seed: 42
+output_root: outputs/multilingual_siren_v2
+cache_dir: null
+max_length: 512
+val_ratio_if_no_validation: 0.2
+test_ratio_if_no_test: 0.1
+
+languages: [en, ko, fr]
+shared_min_langs: 3
+route_unknown_lang_to: en
+label_positive_is_unsafe: true
+
+balance_per_dataset: false
+sampling_strategy: cap
+sampling_by: [source_dataset, lang, label]
+drop_groups_below_min_n: true
+min_samples_per_group: 200
+max_samples_per_group: 5000
+max_samples_per_dataset_split: null
+
+probe:
+  c_values: [200.0, 500.0, 1000.0]
+  metric: f1_macro
+
+mlp:
+  n_trials: 32
+  n_folds: 5
+  batch_size: 8192
+  epochs_final: 512
+  early_stopping_patience: 10
+  weight_decay: 0.0001
+  hidden_layers_min: 2
+  hidden_layers_max: 3
+  hidden_dim_min: 64
+  hidden_dim_max: 2048
+  dropout_min: 0.2
+  dropout_max: 0.5
+  lr_min: 0.0001
+  lr_max: 0.005
+
+datasets:
+  - name: linguasafe_multi
+    enabled: true
+    source: hf
+    hf_id: zhiyuan-ning/linguasafe
+    split_map: {train: train, validation: null, test: null}
+    lang_candidates: [lang, language, locale]
+    keep_langs: [en, ko, fr]
+    text_candidates: [prompt, query, instruction, text, input]
+    label_candidates: [level, severity, risk_level, label, safety_label, is_safe, unsafe]
+    unsafe_values: [1, "1", 2, "2", 3, "3", unsafe, harmful, high, medium, severe, true, True]
+    safe_values: [0, "0", safe, harmless, benign, none, low, false, False]
+    category_candidates: [subtype, domain, category, risk_category, safety_domain]
+
+  - name: lumees_multi
+    enabled: true
+    source: hf
+    hf_id: lumees/multilingual-safety-classification-dataset
+    split_map: {train: train, validation: null, test: null}
+    lang_candidates: [lang, language, locale]
+    keep_langs: [en, ko, fr]
+    text_candidates: [prompt, query, instruction, text, input]
+    label_candidates: [safety_label, label, unsafe, is_unsafe, is_safe]
+    unsafe_values: [1, "1", 2, "2", unsafe, harmful, needs_review, review, true, True]
+    safe_values: [0, "0", safe, harmless, benign, false, False]
+    category_candidates: [category, risk_category, type]
+
+  - name: wildguardmix_ko_test
+    enabled: true
+    source: hf
+    hf_id: iknow-lab/wildguardmix-test-ko
+    split_map: {train: null, validation: null, test: test}
+    lang: ko
+    text_template: "{prompt}\n\n{response}"
+    text_candidates: [prompt, ko_prompt, text, user_prompt]
+    response_candidates: [response, ko_response, assistant_response]
+    label_candidates: [response_harm_label, prompt_harm_label, label, is_harmful, harmful, unsafe]
+    unsafe_values: [harmful, unsafe, Harmful, Unsafe, true, True, 1, "1"]
+    safe_values: [unharmful, safe, benign, Harmless, Safe, false, False, 0, "0"]
+    category_candidates: [subcategory, risk_category, harm_category, category]
+
+  # Larger academic multilingual safety benchmarks.
+  # Convert/download to local JSONL with columns:
+  # text, label, lang, category, split (optional).  label: 1=unsafe, 0=safe.
+
+  - name: malert_local
+    enabled: false
+    source: local
+    path: data/malert_en_fr.jsonl
+    split_map: {train: train, validation: validation, test: test}
+    lang_candidates: [lang, language]
+    keep_langs: [en, fr]
+    text_candidates: [text, prompt, query]
+    label_candidates: [label, unsafe, is_unsafe]
+    unsafe_values: [unsafe, harmful, 1, "1", true, True]
+    safe_values: [safe, harmless, 0, "0", false, False]
+    category_candidates: [category, taxonomy, risk_category]
+
+  - name: xsafety_local
+    enabled: false
+    source: local
+    path: data/xsafety_en_fr.jsonl
+    split_map: {train: train, validation: validation, test: test}
+    lang_candidates: [lang, language]
+    keep_langs: [en, fr]
+    text_candidates: [text, prompt, query]
+    label_candidates: [label, unsafe, is_unsafe]
+    unsafe_values: [unsafe, harmful, 1, "1", true, True]
+    safe_values: [safe, harmless, 0, "0", false, False]
+    category_candidates: [category, task, risk_category]
+
+  - name: korset_local
+    enabled: false
+    source: local
+    path: data/korset_ko.jsonl
+    split_map: {train: train, validation: validation, test: test}
+    lang: ko
+    text_candidates: [text, prompt, query]
+    label_candidates: [label, unsafe, is_unsafe]
+    unsafe_values: [unsafe, harmful, 1, "1", true, True]
+    safe_values: [safe, harmless, 0, "0", false, False]
+    category_candidates: [category, risk_category, domain]

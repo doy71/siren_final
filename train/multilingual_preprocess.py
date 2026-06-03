@@ -286,17 +286,80 @@ def complete_missing_splits(per_dataset_rows: Dict[str, List[Dict[str, Any]]], v
 
 
 def maybe_balance(df: pd.DataFrame, seed: int, by: List[str]) -> pd.DataFrame:
+    # Backward-compatible old behavior: downsample every group to the smallest group.
+    # Use only for debugging / SIREN official reproduction.
+    # For multilingual experiments use sample_by_group(strategy="cap").
+    return sample_by_group(df=df, seed=seed, by=by, strategy="balance_min")
+
+
+def sample_by_group(
+    df: pd.DataFrame,
+    seed: int,
+    by: List[str],
+    strategy: str = "none",
+    min_n: Optional[int] = None,
+    max_n: Optional[int] = None,
+    drop_below_min: bool = False,
+) -> pd.DataFrame:
+    """Group-aware sampling without accidental dataset collapse.
+
+    strategy:
+      "none"        – no resampling (optional drop_below_min filter only).
+      "balance_min" – downsample every group to the smallest group (original behavior).
+      "cap"         – keep all groups but cap large ones to max_n; optionally drop
+                      groups with fewer than min_n samples.
+
+    Recommended:
+      Official SIREN reproduction : strategy="none"
+      Multilingual experiments    : strategy="cap", drop_below_min=True
+    """
     if len(df) == 0:
         return df
+
+    by = [c for c in by if c in df.columns]
+    if not by:
+        return df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
     rng = np.random.default_rng(seed)
+    strategy = str(strategy or "none").lower()
+
+    if strategy == "balance_min":
+        # Use default dropna=True to match original maybe_balance behaviour
+        # (NaN-valued group keys are excluded, not treated as a separate group).
+        groups = [g for _, g in df.groupby(by)]
+        if not groups:
+            return df
+        min_group_n = min(len(g) for g in groups)
+        if min_group_n <= 0:
+            # Original behaviour: return df unchanged when any group is empty.
+            return df
+        sampled = [
+            g.sample(n=min_group_n, random_state=int(rng.integers(0, 1_000_000)))
+            for g in groups
+        ]
+        return pd.concat(sampled, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+    if strategy not in {"none", "cap"}:
+        raise ValueError(f"Unknown sampling_strategy={strategy!r}; expected none/balance_min/cap")
+
     groups = []
-    for _, g in df.groupby(by):
+    dropped = []
+    for key, g in df.groupby(by, dropna=False):
+        if min_n is not None and len(g) < int(min_n):
+            if drop_below_min:
+                dropped.append((key, len(g)))
+                continue
+        if strategy == "cap" and max_n is not None and len(g) > int(max_n):
+            g = g.sample(n=int(max_n), random_state=int(rng.integers(0, 1_000_000)))
         groups.append(g)
-    min_n = min(len(g) for g in groups)
-    if min_n <= 0:
-        return df
-    sampled = [g.sample(n=min_n, random_state=int(rng.integers(0, 1_000_000))) for g in groups]
-    return pd.concat(sampled, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+    if dropped:
+        print(f"[SAMPLE] dropped {len(dropped)} small groups below min_n={min_n}. Examples: {dropped[:10]}")
+
+    if not groups:
+        return df.iloc[0:0].copy()
+
+    return pd.concat(groups, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
 
 def build_normalized_dataset(config: Dict[str, Any], skip_failed: bool = True) -> Dict[str, pd.DataFrame]:
@@ -306,6 +369,12 @@ def build_normalized_dataset(config: Dict[str, Any], skip_failed: bool = True) -
     val_ratio = float(config.get("val_ratio_if_no_validation", 0.2))
     test_ratio = float(config.get("test_ratio_if_no_test", 0.1))
     max_per_split = config.get("max_samples_per_dataset_split")
+    sampling_strategy = str(config.get("sampling_strategy",
+        "balance_min" if config.get("balance_per_dataset", False) else "none"))
+    sampling_by = list(config.get("sampling_by", ["source_dataset", "lang", "label"]))
+    min_samples_per_group = config.get("min_samples_per_group")
+    max_samples_per_group = config.get("max_samples_per_group")
+    drop_groups_below_min_n = bool(config.get("drop_groups_below_min_n", False))
 
     for spec in config.get("datasets", []):
         if not spec.get("enabled", True):
@@ -354,12 +423,21 @@ def build_normalized_dataset(config: Dict[str, Any], skip_failed: bool = True) -
         if languages:
             keep = {norm_lang(x) for x in languages}
             df = df[df["lang"].isin(keep)]
-        if config.get("balance_per_dataset", False):
-            # Preserve SIREN's per-dataset averaging idea by avoiding one dataset/class/language dominating.
-            by_cols = ["source_dataset", "lang", "label"]
-            valid_groups = df.groupby(by_cols).size()
-            if len(valid_groups) > 0 and valid_groups.min() > 0:
-                df = maybe_balance(df, seed, by_cols)
+        # Sampling policy.
+        # Old behavior: balance_per_dataset=True downsampled all (source_dataset, lang, label)
+        # groups to the smallest group, which could collapse a large multilingual run to ~50
+        # samples if one language/label group was tiny.  New default for v2 configs: strategy="cap".
+        strategy = "balance_min" if config.get("balance_per_dataset", False) else sampling_strategy
+        if strategy != "none" or drop_groups_below_min_n:
+            df = sample_by_group(
+                df=df,
+                seed=seed,
+                by=sampling_by,
+                strategy=strategy,
+                min_n=min_samples_per_group,
+                max_n=max_samples_per_group,
+                drop_below_min=drop_groups_below_min_n,
+            )
         dfs[split] = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
     return dfs
 

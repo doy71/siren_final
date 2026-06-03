@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import argparse
 import json
+import hashlib
 import os
 import pickle
 import random
@@ -107,6 +108,53 @@ def compute_per_dataset_macro_f1(y_true: np.ndarray, y_pred: np.ndarray, dataset
     return float(np.mean(vals)) if vals else 0.0
 
 
+def _stable_counts(values: Sequence[Any]) -> Dict[str, int]:
+    vals, counts = np.unique(np.asarray(values).astype(str), return_counts=True)
+    return {str(v): int(c) for v, c in zip(vals, counts)}
+
+
+def dataset_signature_from_dfs(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    """Compact signature for representation cache invalidation.
+
+    Caches become stale when dataset composition changes (different samples,
+    different preprocessing, different splits).  This signature captures enough
+    of the dataset to detect any such change reliably.
+    """
+    sig: Dict[str, Any] = {}
+    for split, df in dfs.items():
+        if df is None or len(df) == 0:
+            sig[split] = {"n": 0}
+            continue
+        split_sig: Dict[str, Any] = {
+            "n": int(len(df)),
+            "columns": sorted([str(c) for c in df.columns]),
+        }
+        for col in ["source_dataset", "lang", "label", "category"]:
+            if col in df.columns:
+                split_sig[f"{col}_counts"] = _stable_counts(df[col].to_numpy())
+        cols = [c for c in ["source_dataset", "source_id", "lang", "label", "text"] if c in df.columns]
+        payload = df[cols].astype(str).to_json(orient="records", force_ascii=False)
+        split_sig["content_sha256"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        sig[split] = split_sig
+    return sig
+
+
+def dataset_signature_from_reps(all_reps: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Compact signature derived from already-extracted representations."""
+    sig: Dict[str, Any] = {}
+    for split, r in all_reps.items():
+        split_sig: Dict[str, Any] = {
+            "n": int(len(r.get("labels", []))),
+            "label_counts": _stable_counts(r.get("labels", [])),
+        }
+        if "source_datasets" in r:
+            split_sig["source_dataset_counts"] = _stable_counts(r["source_datasets"])
+        if "langs" in r:
+            split_sig["lang_counts"] = _stable_counts(r["langs"])
+        sig[split] = split_sig
+    return sig
+
+
 # -----------------------------
 # Model / representation extraction
 # -----------------------------
@@ -153,19 +201,31 @@ def extract_representations(
     pooling_types: Sequence[str],
     out_dir: str,
     force_reextract: bool = False,
+    dataset_signature: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     cache_path = os.path.join(out_dir, "reps_cache", f"{model_name}_representations.pkl")
+    meta_path = cache_path + ".meta.json"
+    want_meta = {
+        "model_name": model_name,
+        "pooling_types": sorted([str(x) for x in pooling_types]),
+        "dataset_signature": dataset_signature or dataset_signature_from_dfs(dfs),
+    }
     if os.path.exists(cache_path) and not force_reextract:
-        with open(cache_path, "rb") as f:
-            cached = pickle.load(f)
-        avail = available_pooling_types(cached)
-        if set(pooling_types).issubset(avail):
-            print(f"[CACHE] loading representations: {cache_path} (pooling={sorted(avail)})")
-            return cached
-        # Cache was built with a different pooling/rep set; reusing it would
-        # silently miss keys (e.g. KeyError 'mlp_mean'). Re-extract instead.
-        print(f"[CACHE] stale representations cache: have {sorted(avail)}, "
-              f"need {sorted(pooling_types)}; re-extracting.")
+        have_meta = None
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                have_meta = json.load(f)
+        if have_meta == want_meta:
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+            avail = available_pooling_types(cached)
+            if set(pooling_types).issubset(avail):
+                print(f"[CACHE] loading representations: {cache_path} (pooling={sorted(avail)})")
+                return cached
+            print(f"[CACHE] stale representations cache: have {sorted(avail)}, "
+                  f"need {sorted(pooling_types)}; re-extracting.")
+        else:
+            print("[CACHE] stale representations cache: dataset/model/pooling signature changed; re-extracting.")
 
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     cfg = MODEL_CONFIGS[model_name]
@@ -201,6 +261,8 @@ def extract_representations(
 
     with open(cache_path, "wb") as f:
         pickle.dump(all_reps, f)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(want_meta, f, indent=2, ensure_ascii=False)
     return all_reps
 
 
@@ -272,6 +334,7 @@ def train_all_probes(
         "pooling_types": sorted(pooling_types),
         "c_values": [float(c) for c in c_values],
         "metric": metric,
+        "dataset_signature": dataset_signature_from_reps(all_reps),
     }
     if os.path.exists(global_path) and os.path.exists(lang_path) and not force_retrain:
         have_meta = None
@@ -338,6 +401,10 @@ def train_all_probes(
 
 
 def select_salient_neurons(probe: LinearProbe, threshold: float) -> List[int]:
+    # Cumulative absolute probe-weight importance — matches SIREN paper.
+    # NOTE: CSSLab LinearProbe uses Adam + soft L1 (not sklearn exact-L1), so weights
+    # rarely reach exactly 0.  This means selection ratios can be high even at threshold=0.9.
+    # Use selection_debug_stats() to inspect the weight distribution.
     weights = probe.get_feature_importance()
     total = float(np.sum(weights))
     if total <= 0:
@@ -351,6 +418,72 @@ def select_salient_neurons(probe: LinearProbe, threshold: float) -> List[int]:
         if csum >= threshold * total:
             break
     return selected
+
+
+def selection_debug_stats(probe: LinearProbe, selected: Sequence[int]) -> Dict[str, Any]:
+    """Per-probe diagnostics for understanding why selection ratios are high.
+
+    Key indicators:
+      selected_ratio  – fraction of all neurons selected (>0.5 signals flat weights).
+      top100_cum_ratio – cumulative importance of top-100 neurons; if this is below
+                         ~0.5 the weight distribution is very flat (soft-L1 artifact).
+      nonzero_gt_1e_6 – neurons above 1e-6 importance; closer to hidden_size = flat.
+    """
+    w = np.asarray(probe.get_feature_importance(), dtype=np.float64)
+    total = float(w.sum())
+    sw = np.sort(w)[::-1]
+    hidden = int(len(w))
+    if total <= 0 or hidden == 0:
+        return {"hidden_size": hidden, "selected": int(len(selected)), "selected_ratio": 0.0,
+                "total_importance": total}
+
+    def top_ratio(k: int) -> float:
+        k = min(k, hidden)
+        return float(sw[:k].sum() / total)
+
+    return {
+        "hidden_size": hidden,
+        "selected": int(len(selected)),
+        "selected_ratio": float(len(selected) / hidden),
+        "total_importance": total,
+        "nonzero_gt_1e_8": int((w > 1e-8).sum()),
+        "nonzero_gt_1e_6": int((w > 1e-6).sum()),
+        "nonzero_gt_1e_4": int((w > 1e-4).sum()),
+        "top10_cum_ratio": top_ratio(10),
+        "top50_cum_ratio": top_ratio(50),
+        "top100_cum_ratio": top_ratio(100),
+        "top500_cum_ratio": top_ratio(500),
+        "max_weight": float(w.max()),
+        "mean_weight": float(w.mean()),
+        "median_weight": float(np.median(w)),
+    }
+
+
+def collect_selection_debug(
+    global_probes: Dict[str, Any],
+    lang_probes: Dict[str, Dict[str, Any]],
+    languages: Sequence[str],
+    pooling_type: str,
+    threshold: float,
+    num_layers: int,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"global": {}, "language": {}}
+    for layer_idx in range(num_layers):
+        key = probe_key(layer_idx, pooling_type)
+        if key in global_probes:
+            probe = global_probes[key]["probe"]
+            selected = select_salient_neurons(probe, threshold)
+            out["global"][str(layer_idx)] = selection_debug_stats(probe, selected)
+    for lang in languages:
+        out["language"][str(lang)] = {}
+        probes = lang_probes.get(lang, {})
+        for layer_idx in range(num_layers):
+            key = probe_key(layer_idx, pooling_type)
+            if key in probes:
+                probe = probes[key]["probe"]
+                selected = select_salient_neurons(probe, threshold)
+                out["language"][str(lang)][str(layer_idx)] = selection_debug_stats(probe, selected)
+    return out
 
 
 def get_layer_weights(global_probes: Dict[str, Any], pooling_type: str, num_layers: int) -> Dict[int, float]:
@@ -889,6 +1022,9 @@ def run_method(
         "layer_weights": {str(k): float(v) for k, v in layer_weights.items()},
         "shared_min_langs": int(config.get("shared_min_langs", len(languages))),
         "active_feature_counts": active_feature_counts(features, languages),
+        "selection_debug": collect_selection_debug(
+            global_probes, lang_probes, languages, pooling_type, threshold, num_layers
+        ),
     }
     with open(os.path.join(run_dir, "selected_neurons.json"), "w", encoding="utf-8") as f:
         json.dump(selected_summary, f, indent=2, ensure_ascii=False)
@@ -943,7 +1079,13 @@ def main():
     save_dataset_artifacts(dfs, out_dir)
 
     print("\n[2] Extract SIREN representations")
-    all_reps = extract_representations(args.model, dfs, str(device), args.batch_size, args.pooling_types, out_dir, force_reextract=args.force_reextract)
+    dataset_sig = dataset_signature_from_dfs(dfs)
+    with open(os.path.join(out_dir, "dataset_signature.json"), "w", encoding="utf-8") as f:
+        json.dump(dataset_sig, f, indent=2, ensure_ascii=False)
+    all_reps = extract_representations(
+        args.model, dfs, str(device), args.batch_size, args.pooling_types, out_dir,
+        force_reextract=args.force_reextract, dataset_signature=dataset_sig,
+    )
 
     print("\n[3] Train global and language-specific SIREN probes")
     global_probes, lang_probes = train_all_probes(
