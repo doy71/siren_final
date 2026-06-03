@@ -1,14 +1,21 @@
 #!/usr/bin/env python
-"""
-Quick neuron-selection dry run.
+"""Quick neuron-selection precheck.
 
-Checks how many neurons SIREN-style probe selection chooses WITHOUT training the final MLP.
-Run from repo root after applying siren_dataset_selection_patch.zip.
+This script stops before final MLP training. It only does:
+  1. normalize dataset
+  2. extract/reuse backbone representations
+  3. train global/language SIREN probes
+  4. report selected neuron counts and feature budgets per method
+
+Use it before the full experiment to check whether SIREN-style neuron selection is
+already too large on the chosen dataset/languages.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Sequence
@@ -18,8 +25,7 @@ import pandas as pd
 import torch
 import yaml
 
-ROOT = Path.cwd()
-sys.path.append(str(ROOT))
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from train.multilingual_preprocess import build_normalized_dataset, save_dataset_artifacts
 from train.train_multilingual_siren_selection import (
@@ -35,6 +41,7 @@ from train.train_multilingual_siren_selection import (
     train_all_probes,
 )
 
+
 DEFAULT_METHODS = [
     "siren_original",
     "shared_only",
@@ -49,17 +56,36 @@ def flatten_selection_debug(debug: Dict[str, Any], threshold: float, pooling_typ
     rows = []
     for layer, stats in (debug.get("global") or {}).items():
         row = dict(stats)
-        row.update({"threshold": threshold, "pooling_type": pooling_type, "scope": "global", "lang": None, "layer_idx": int(layer)})
+        row.update({
+            "threshold": threshold,
+            "pooling_type": pooling_type,
+            "scope": "global",
+            "lang": None,
+            "layer_idx": int(layer),
+        })
         rows.append(row)
     for lang, by_layer in (debug.get("language") or {}).items():
         for layer, stats in by_layer.items():
             row = dict(stats)
-            row.update({"threshold": threshold, "pooling_type": pooling_type, "scope": "language", "lang": lang, "layer_idx": int(layer)})
+            row.update({
+                "threshold": threshold,
+                "pooling_type": pooling_type,
+                "scope": "language",
+                "lang": lang,
+                "layer_idx": int(layer),
+            })
             rows.append(row)
     return pd.DataFrame(rows)
 
 
-def summarize_selected_dict(selected: Dict[int, Sequence[int]], hidden_size_by_layer: Dict[int, int], scope: str, threshold: float, pooling_type: str, lang: str | None = None) -> list[dict[str, Any]]:
+def summarize_selected_dict(
+    selected: Dict[int, Sequence[int]],
+    hidden_size_by_layer: Dict[int, int],
+    scope: str,
+    threshold: float,
+    pooling_type: str,
+    lang: str | None = None,
+) -> list[dict[str, Any]]:
     rows = []
     for layer, neurons in sorted(selected.items()):
         hidden = int(hidden_size_by_layer.get(int(layer), 0))
@@ -77,6 +103,30 @@ def summarize_selected_dict(selected: Dict[int, Sequence[int]], hidden_size_by_l
     return rows
 
 
+def print_dataset_status(dfs: Dict[str, pd.DataFrame]) -> None:
+    for split, df in dfs.items():
+        print("\n" + "=" * 100)
+        print(f"[{split}] total n={len(df)}")
+        if len(df) == 0:
+            continue
+        print("\nsource_dataset × lang × label")
+        print(
+            df.groupby(["source_dataset", "lang", "label"])
+            .size()
+            .reset_index(name="n")
+            .sort_values(["source_dataset", "lang", "label"])
+            .to_string(index=False)
+        )
+        print("\nlang × label")
+        print(
+            df.groupby(["lang", "label"])
+            .size()
+            .reset_index(name="n")
+            .sort_values(["lang", "label"])
+            .to_string(index=False)
+        )
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
@@ -90,14 +140,14 @@ def main() -> None:
     p.add_argument("--skip_failed_datasets", action="store_true")
     p.add_argument("--force_reextract", action="store_true")
     p.add_argument("--force_retrain_probes", action="store_true")
+
+    # Speed controls for precheck only.
     p.add_argument("--max_samples_per_dataset_split", type=int, default=None)
     p.add_argument("--max_samples_per_group", type=int, default=300)
     p.add_argument("--min_samples_per_group", type=int, default=None)
     p.add_argument("--no_drop_small_groups", action="store_true")
     p.add_argument("--c_values", nargs="+", type=float, default=None)
-    p.add_argument("--n_c_values", type=int, default=None, help="Use only the first N C values for faster dry runs.")
-    p.add_argument("--eps_weight_ratio", type=float, default=0.0,
-                   help="Pre-filter near-zero probe weights (0=off; try 1e-3 for soft-L1 probes).")
+    p.add_argument("--n_c_values", type=int, default=1)
     args = p.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -119,10 +169,6 @@ def main() -> None:
     if args.n_c_values is not None:
         c_values = c_values[: int(args.n_c_values)]
     config["probe"]["c_values"] = [float(c) for c in c_values]
-    # Propagate eps_weight_ratio into config so selection functions pick it up.
-    if args.eps_weight_ratio != 0.0:
-        config["probe"]["eps_weight_ratio"] = float(args.eps_weight_ratio)
-    eps_weight_ratio = float(config.get("probe", {}).get("eps_weight_ratio", 0.0))
 
     seed = int(config.get("seed", 42))
     set_seed(seed)
@@ -135,17 +181,14 @@ def main() -> None:
 
     print("[1] Build normalized dataset")
     dfs = build_normalized_dataset(config, skip_failed=args.skip_failed_datasets)
-    for split, df in dfs.items():
-        langs = sorted(df["lang"].unique().tolist()) if len(df) and "lang" in df else []
-        labels = df["label"].value_counts().to_dict() if len(df) and "label" in df else {}
-        print(f"{split:10s}: {len(df):7d} | langs={langs} | labels={labels}")
-
+    print_dataset_status(dfs)
     save_dataset_artifacts(dfs, str(out_dir))
+
     dataset_sig = dataset_signature_from_dfs(dfs)
     with open(out_dir / "dataset_signature.json", "w", encoding="utf-8") as f:
         json.dump(dataset_sig, f, indent=2, ensure_ascii=False)
 
-    print("[2] Extract/reuse representations")
+    print("\n[2] Extract/reuse representations")
     all_reps = extract_representations(
         args.model,
         dfs,
@@ -157,7 +200,7 @@ def main() -> None:
         dataset_signature=dataset_sig,
     )
 
-    print("[3] Train global/language probes only")
+    print("\n[3] Train global/language probes only")
     languages = [str(x) for x in config.get("languages", sorted(set(all_reps["train"]["langs"])))]
     global_probes, lang_probes = train_all_probes(
         all_reps=all_reps,
@@ -170,7 +213,7 @@ def main() -> None:
         force_retrain=args.force_retrain_probes,
     )
 
-    print("[4] Compute selection counts and method budgets")
+    print("\n[4] Compute selection counts and method budgets")
     num_layers = int(all_reps["train"]["num_layers"])
     selection_rows = []
     debug_frames = []
@@ -179,13 +222,14 @@ def main() -> None:
     for pooling_type in args.pooling_types:
         hidden_size_by_layer = infer_hidden_size_by_layer(all_reps["train"]["representations"], pooling_type, num_layers)
         for threshold in args.thresholds:
-            global_sel = selected_global(global_probes, pooling_type, threshold, num_layers, eps_weight_ratio)
-            lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers, eps_weight_ratio)
+            global_sel = selected_global(global_probes, pooling_type, threshold, num_layers)
+            lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers)
+
             selection_rows.extend(summarize_selected_dict(global_sel, hidden_size_by_layer, "global", threshold, pooling_type, None))
             for lang in languages:
                 selection_rows.extend(summarize_selected_dict(lang_sel.get(lang, {}), hidden_size_by_layer, "language", threshold, pooling_type, lang))
 
-            debug = collect_selection_debug(global_probes, lang_probes, languages, pooling_type, threshold, num_layers, eps_weight_ratio)
+            debug = collect_selection_debug(global_probes, lang_probes, languages, pooling_type, threshold, num_layers)
             debug_frames.append(flatten_selection_debug(debug, threshold, pooling_type))
 
             for method in args.methods:
@@ -220,16 +264,10 @@ def main() -> None:
     debug_df.to_csv(debug_path, index=False)
     budget_df.to_csv(budget_path, index=False)
 
-    print("\nSaved:")
-    print(f"  {selection_path}")
-    print(f"  {debug_path}")
-    print(f"  {budget_path}")
-
     print("\n=== Method feature budgets ===")
-    if len(budget_df):
-        print(budget_df.to_string(index=False))
+    print(budget_df.to_string(index=False) if len(budget_df) else "empty")
 
-    print("\n=== Global selection summary by threshold/pooling ===")
+    print("\n=== Global selection summary ===")
     if len(selection_df):
         global_sum = (
             selection_df[selection_df["scope"] == "global"]
@@ -240,6 +278,10 @@ def main() -> None:
         global_sum["total_selected_ratio"] = global_sum["total_selected"] / global_sum["total_hidden"]
         print(global_sum.to_string(index=False))
 
+    print("\nSaved:")
+    print(f"  {selection_path}")
+    print(f"  {debug_path}")
+    print(f"  {budget_path}")
     print("\nInterpretation tip:")
     print("  If top100_cum_ratio is low and nonzero_gt_1e_6 is close to hidden_size,")
     print("  the L1 probe is diffuse; selection is large because importance is spread out.")
