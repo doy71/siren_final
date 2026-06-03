@@ -886,7 +886,9 @@ def optuna_objective(
             max_dim = max(min_dim, max_dim)
         else:
             min_dim = int(cfg["hidden_dim_min"])
-            max_dim = min(layer_dims[-1], int(cfg["hidden_dim_max"]))
+            # Official train_general_siren.py: max_dim = min(layer_dims[-1], 1024)
+            # FIX: was using hidden_dim_max (2048) — official caps subsequent layers at 1024.
+            max_dim = min(layer_dims[-1], 1024)
             max_dim = max(min_dim, max_dim)
         step = 64 if max_dim - min_dim >= 64 else 1
         h = trial.suggest_int(f"hidden_dim_layer{i}", min_dim, max_dim, step=step)
@@ -936,21 +938,51 @@ def search_mlp_params(X_train: np.ndarray, y_train: np.ndarray, dataset_ids: np.
 
 
 def train_final_mlp(
-    X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray, val_dataset_ids: np.ndarray,
+    X_train: np.ndarray, y_train: np.ndarray,
     params: Dict[str, Any], device: torch.device, cfg: Dict[str, Any], cv_f1: float,
 ) -> Tuple[nn.Module, float]:
+    """Train final MLP on full data (train+val merged) for fixed epochs — no early stopping.
+
+    Matches official train_general_siren.py train_final_model(use_val=False):
+    - Training data: X_train (caller must pass train+val merged as X_train)
+    - Epochs: cfg.epochs_final (default 512), fixed — no early stopping, no val monitoring
+    - val_f1 returned = cv_f1 from Optuna search (same as official)
+
+    FIX: previous version trained on X_train only and used val for early stopping (patience=10),
+    which is NOT what the official does. Official trains on train+val merged with no val monitoring.
+    """
     input_dim = X_train.shape[1]
     n_layers = int(params["n_layers"])
     dims = [int(params[f"hidden_dim_layer{i}"]) for i in range(n_layers)]
     drops = [float(params[f"dropout_layer{i}"]) for i in range(n_layers)]
     model = AdaptiveMLPClassifier(input_dim, dims, drops).to(device)
-    best_val = train_model(
-        model, X_train, y_train, X_val, y_val, val_dataset_ids,
-        lr=float(params["lr"]), batch_size=int(cfg["batch_size"]), epochs=int(cfg.get("epochs_final", 512)),
-        device=device, patience=int(cfg.get("early_stopping_patience", 10)), show_progress=True,
+
+    optimizer = optim.Adam(
+        model.parameters(), lr=float(params["lr"]),
         weight_decay=float(cfg.get("weight_decay", 1e-4)),
     )
-    return model, best_val if best_val > 0 else cv_f1
+    criterion = nn.CrossEntropyLoss()
+    use_cuda_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(device.type, enabled=use_cuda_amp)
+    epochs = int(cfg.get("epochs_final", 512))
+    batch_size = int(cfg["batch_size"])
+
+    for epoch in tqdm(range(epochs), desc="train final mlp"):
+        model.train()
+        indices = torch.randperm(len(X_train))
+        for start in range(0, len(X_train), batch_size):
+            idx = indices[start:start + batch_size]
+            bx = torch.tensor(X_train[idx], dtype=torch.float32, device=device)
+            by = torch.tensor(y_train[idx], dtype=torch.long, device=device)
+            optimizer.zero_grad()
+            with torch.amp.autocast(device.type, enabled=use_cuda_amp):
+                loss = criterion(model(bx), by)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+    # Return cv_f1 as the reported val metric (official does the same)
+    return model, cv_f1
 
 
 def dataset_ids_from_sources(sources: np.ndarray, vocab: Dict[str, int]) -> np.ndarray:
@@ -1024,8 +1056,10 @@ def run_method(
     mlp_cfg = dict(config["mlp"])
     mlp_cfg["n_folds"] = int(config["mlp"].get("n_folds", 3))
     params, cv_f1 = search_mlp_params(X_cv, y_cv, ds_cv, device, mlp_cfg, seed)
+    # Official: train final model on X_train+X_val merged, 512 epochs, no early stopping.
+    # FIX: was passing only X_train with val monitoring — now matches official exactly.
     model, best_val_f1 = train_final_mlp(
-        X_train, all_reps["train"]["labels"], X_val, all_reps["validation"]["labels"], val_ds_ids,
+        X_cv, y_cv,
         params, device, mlp_cfg, cv_f1,
     )
 

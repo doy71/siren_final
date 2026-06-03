@@ -18,7 +18,8 @@ route_unknown_lang_to: en
 label_positive_is_unsafe: true
 
 probe:
-  c_values: [100.0, 1000.0]
+  # Official run_general_siren.sh: C_VALUES="200.0 500.0 1000.0"
+  c_values: [200.0, 500.0, 1000.0]
   metric: f1_macro
   quick_eval: true
   # eps_weight_ratio: pre-filter near-zero probe weights before cumulative selection.
@@ -29,7 +30,7 @@ probe:
 
 mlp:
   n_trials: 32
-  n_folds: 3
+  n_folds: 5  # official N_FOLDS=5 (run_general_siren.sh)
   batch_size: 8192
   epochs_final: 512
   early_stopping_patience: 10
