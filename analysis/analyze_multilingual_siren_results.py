@@ -54,15 +54,45 @@ def metrics_from_df(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def _path_metadata(path: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for part in os.path.normpath(path).split(os.sep):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            out[key] = value
+    return out
+
+
+def _selection_fields(m: Dict[str, Any], path: str) -> Dict[str, Any]:
+    path_meta = _path_metadata(path)
+    selection_langs = m.get("selection_langs") or path_meta.get("selection_langs") or ""
+    selection_languages = m.get("selection_languages") or ([x for x in str(selection_langs).split("-") if x])
+    # Legacy shared_only runs used all configured language probes but did not
+    # store subset metadata. Infer those languages from active_feature_counts.
+    if not selection_languages and m.get("method") == "shared_only":
+        selection_languages = [str(k) for k in (m.get("active_feature_counts") or {}).keys() if str(k) != "union_dim"]
+        selection_langs = "-".join(selection_languages)
+    excluded = m.get("excluded_languages") or []
+    return {
+        "selection_langs": str(selection_langs),
+        "selection_languages": ",".join(str(x) for x in selection_languages),
+        "n_selection_languages": int(m.get("n_selection_languages") or len(selection_languages) or 0),
+        "excluded_languages": ",".join(str(x) for x in excluded),
+    }
+
+
 def load_runs(run_dir: str) -> pd.DataFrame:
     rows = []
-    for path in glob.glob(os.path.join(run_dir, "method=*", "threshold=*", "pooling=*", "seed=*", "metrics.json")):
+    paths = glob.glob(os.path.join(run_dir, "method=*", "**", "metrics.json"), recursive=True)
+    for path in paths:
         with open(path, "r", encoding="utf-8") as f:
             m = json.load(f)
         row = {
             "run_path": os.path.dirname(path),
+            "explicit_subset_path": any(part.startswith("selection_langs=") for part in os.path.normpath(path).split(os.sep)),
             "model": m.get("model"),
             "method": m.get("method"),
+            **_selection_fields(m, path),
             "threshold": m.get("threshold"),
             "pooling_type": m.get("pooling_type"),
             "seed": m.get("seed"),
@@ -91,6 +121,9 @@ def collect_group_metrics(run_df: pd.DataFrame, group_col: str, split: str = "te
             m = metrics_from_df(g)
             rows.append({
                 "method": r["method"],
+                "selection_langs": r.get("selection_langs", ""),
+                "n_selection_languages": r.get("n_selection_languages", 0),
+                "excluded_languages": r.get("excluded_languages", ""),
                 "threshold": r["threshold"],
                 "pooling_type": r["pooling_type"],
                 "seed": r["seed"],
@@ -114,6 +147,9 @@ def collect_selection(run_df: pd.DataFrame) -> pd.DataFrame:
         for (layer, kind, route), g in fdf.groupby(["layer", "kind", "route_lang"], dropna=False):
             rows.append({
                 "method": r["method"],
+                "selection_langs": r.get("selection_langs", ""),
+                "n_selection_languages": r.get("n_selection_languages", 0),
+                "excluded_languages": r.get("excluded_languages", ""),
                 "threshold": r["threshold"],
                 "pooling_type": r["pooling_type"],
                 "seed": r["seed"],
@@ -135,6 +171,9 @@ def collect_layer_values(run_df: pd.DataFrame) -> pd.DataFrame:
             # lack method/pooling_type for older runs); attach from run_df so
             # the downstream groupby on these keys never raises KeyError.
             df["method"] = r["method"]
+            df["selection_langs"] = r.get("selection_langs", "")
+            df["n_selection_languages"] = r.get("n_selection_languages", 0)
+            df["excluded_languages"] = r.get("excluded_languages", "")
             df["threshold"] = r["threshold"]
             df["pooling_type"] = r["pooling_type"]
             df["seed"] = r["seed"]
@@ -190,6 +229,85 @@ def bar_plot(df: pd.DataFrame, x: str, y: str, path: str, title: str, group: Opt
     plt.close()
 
 
+def subset_size_summary(shared_runs: pd.DataFrame) -> pd.DataFrame:
+    if len(shared_runs) == 0:
+        return pd.DataFrame()
+    value_cols = [
+        c for c in [
+            "test_macro_f1", "test_unsafe_f1", "test_balanced_accuracy", "test_mcc",
+            "test_auroc", "test_auprc", "num_features_union_dim",
+        ] if c in shared_runs.columns
+    ]
+    grouped = shared_runs.groupby(["model", "n_selection_languages", "threshold", "pooling_type"])[value_cols].agg(["mean", "std", "min", "max", "count"]).reset_index()
+    grouped.columns = ["_".join([str(x) for x in col if x != ""]).rstrip("_") for col in grouped.columns]
+    return grouped
+
+
+def language_inclusion_effects(shared_runs: pd.DataFrame) -> pd.DataFrame:
+    if len(shared_runs) == 0:
+        return pd.DataFrame()
+    all_languages = sorted({lang for slug in shared_runs["selection_langs"].astype(str) for lang in slug.split("-") if lang})
+    rows = []
+    for (model, n_langs, threshold, pooling), base in shared_runs.groupby(["model", "n_selection_languages", "threshold", "pooling_type"]):
+        for lang in all_languages:
+            included_mask = base["selection_langs"].astype(str).apply(lambda x: lang in x.split("-"))
+            included = base[included_mask]
+            excluded = base[~included_mask]
+            if len(included) == 0 or len(excluded) == 0:
+                continue
+            row = {
+                "model": model,
+                "n_selection_languages": n_langs,
+                "threshold": threshold,
+                "pooling_type": pooling,
+                "language": lang,
+                "n_included_runs": int(len(included)),
+                "n_excluded_runs": int(len(excluded)),
+            }
+            for col in ["test_macro_f1", "test_unsafe_f1", "num_features_union_dim"]:
+                if col in base.columns:
+                    inc = float(included[col].mean())
+                    exc = float(excluded[col].mean())
+                    row[f"{col}_included_mean"] = inc
+                    row[f"{col}_excluded_mean"] = exc
+                    row[f"{col}_included_minus_excluded"] = inc - exc
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def subset_scatter(df: pd.DataFrame, path: str) -> None:
+    if len(df) == 0 or "test_macro_f1" not in df or "num_features_union_dim" not in df:
+        return
+    plt.figure(figsize=(10, 7))
+    for n_langs, g in df.groupby("n_selection_languages"):
+        plt.scatter(g["num_features_union_dim"], g["test_macro_f1"], label=f"{int(n_langs)} languages")
+    for _, row in df.iterrows():
+        plt.annotate(str(row["selection_langs"]), (row["num_features_union_dim"], row["test_macro_f1"]), fontsize=6, alpha=0.75)
+    plt.xlabel("Shared feature dimension")
+    plt.ylabel("Test macro-F1")
+    plt.title("Shared-only subset: performance vs feature dimension")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+
+def subset_size_plot(df: pd.DataFrame, y: str, path: str, title: str) -> None:
+    if len(df) == 0 or y not in df:
+        return
+    agg = df.groupby("n_selection_languages")[y].agg(["mean", "std"]).reset_index().sort_values("n_selection_languages")
+    plt.figure(figsize=(8, 5))
+    plt.errorbar(agg["n_selection_languages"], agg["mean"], yerr=agg["std"].fillna(0.0), marker="o", capsize=4)
+    plt.xlabel("Number of languages used for shared intersection")
+    plt.ylabel(y)
+    plt.title(title)
+    plt.xticks(sorted(df["n_selection_languages"].unique()))
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run_dir", required=True)
@@ -203,12 +321,16 @@ def main():
     runs = load_runs(args.run_dir)
     if len(runs) == 0:
         raise FileNotFoundError(f"No metrics.json found under {args.run_dir}")
-    runs = runs.sort_values(["pooling_type", "threshold", "method", "seed"])
+    # Prefer the new explicit subset-path run over a legacy all-language
+    # shared_only run when both describe the same experiment key.
+    dedupe_keys = ["model", "method", "selection_langs", "threshold", "pooling_type", "seed"]
+    runs = runs.sort_values(dedupe_keys + ["explicit_subset_path"]).drop_duplicates(dedupe_keys, keep="last")
+    runs = runs.sort_values(["pooling_type", "threshold", "method", "n_selection_languages", "selection_langs", "seed"])
     save_table(runs, os.path.join(args.out_dir, "metrics_summary.csv"))
 
-    # Mean/std summary across seeds.
     metric_cols = [c for c in runs.columns if c.startswith("test_") and pd.api.types.is_numeric_dtype(runs[c])]
-    agg = runs.groupby(["method", "threshold", "pooling_type"])[metric_cols + ["num_features_union_dim"]].agg(["mean", "std"]).reset_index()
+    group_keys = ["method", "selection_langs", "n_selection_languages", "threshold", "pooling_type"]
+    agg = runs.groupby(group_keys)[metric_cols + ["num_features_union_dim"]].agg(["mean", "std"]).reset_index()
     agg.columns = ["_".join([str(x) for x in col if x != ""]).rstrip("_") for col in agg.columns]
     save_table(agg, os.path.join(args.out_dir, "metrics_mean_std.csv"))
 
@@ -223,7 +345,7 @@ def main():
     layer_values = collect_layer_values(runs)
     if len(layer_values) > 0:
         layer_dist = (
-            layer_values.groupby(["method", "threshold", "pooling_type", "lang", "layer_idx"])
+            layer_values.groupby(["method", "selection_langs", "n_selection_languages", "threshold", "pooling_type", "lang", "layer_idx"])
             .agg(n_selected_neurons=("n_selected_neurons", "mean"), abs_sum=("abs_sum", "mean"), l2=("l2", "mean"))
             .reset_index()
         )
@@ -231,26 +353,30 @@ def main():
     else:
         layer_dist = pd.DataFrame()
 
-    # Plots: keep metrics intentionally non-redundant.
+    shared_runs = runs[runs["method"] == "shared_only"].copy()
+    save_table(shared_runs, os.path.join(args.out_dir, "shared_only_by_subset.csv"))
+    size_summary = subset_size_summary(shared_runs)
+    save_table(size_summary, os.path.join(args.out_dir, "shared_only_by_subset_size.csv"))
+    inclusion = language_inclusion_effects(shared_runs)
+    save_table(inclusion, os.path.join(args.out_dir, "shared_only_language_inclusion_effect.csv"))
+
+    # General plots retained for compatibility with previous experiments.
     bar_plot(runs, "method", "test_macro_f1", os.path.join(plot_dir, "overall_macro_f1_by_method.png"), "Overall Macro-F1 by method", group="threshold")
-    bar_plot(runs, "method", "test_auroc", os.path.join(plot_dir, "overall_auroc_by_method.png"), "Overall AUROC by method", group="threshold")
-    bar_plot(runs, "method", "test_auprc", os.path.join(plot_dir, "overall_auprc_by_method.png"), "Overall AUPRC by method", group="threshold")
     bar_plot(runs, "method", "num_features_union_dim", os.path.join(plot_dir, "feature_dim_by_method.png"), "Union feature dimension by method", group="threshold")
 
-    if len(lang_metrics) > 0:
-        bar_plot(lang_metrics, "method", "macro_f1", os.path.join(plot_dir, "language_macro_f1_by_method.png"), "Per-language Macro-F1 by method", group="lang")
-        bar_plot(lang_metrics, "method", "recall_unsafe", os.path.join(plot_dir, "language_unsafe_recall_by_method.png"), "Per-language unsafe recall by method", group="lang")
-
-    if len(layer_dist) > 0:
-        for method in sorted(layer_dist["method"].unique()):
-            sub = layer_dist[layer_dist["method"] == method]
-            line_plot(sub, "layer_idx", "n_selected_neurons", "lang", os.path.join(plot_dir, f"layer_selected_neurons_{method}.png"), f"Layer distribution: {method}", "mean selected/active neurons")
-            line_plot(sub, "layer_idx", "abs_sum", "lang", os.path.join(plot_dir, f"layer_abs_sum_{method}.png"), f"Layer abs activation sum: {method}", "mean abs_sum")
+    # Subset-specific plots answer the current experiment questions directly.
+    subset_size_plot(shared_runs, "test_macro_f1", os.path.join(plot_dir, "shared_macro_f1_by_subset_size.png"), "Shared-only macro-F1 by subset size")
+    subset_size_plot(shared_runs, "num_features_union_dim", os.path.join(plot_dir, "shared_feature_dim_by_subset_size.png"), "Shared feature dimension by subset size")
+    subset_scatter(shared_runs, os.path.join(plot_dir, "shared_macro_f1_vs_feature_dim.png"))
+    if len(shared_runs) > 0:
+        bar_plot(shared_runs, "selection_langs", "test_macro_f1", os.path.join(plot_dir, "shared_macro_f1_by_subset.png"), "Shared-only macro-F1 by language subset")
+        bar_plot(shared_runs, "selection_langs", "num_features_union_dim", os.path.join(plot_dir, "shared_feature_dim_by_subset.png"), "Shared feature dimension by language subset")
 
     print(f"Saved analysis to {args.out_dir}")
     print("Top runs by test_macro_f1:")
-    cols = ["method", "threshold", "pooling_type", "seed", "test_macro_f1", "test_auroc", "test_auprc", "num_features_union_dim"]
-    print(runs.sort_values("test_macro_f1", ascending=False)[cols].head(20).to_string(index=False))
+    cols = ["method", "selection_langs", "n_selection_languages", "threshold", "pooling_type", "seed", "test_macro_f1", "test_auroc", "num_features_union_dim"]
+    cols = [c for c in cols if c in runs.columns]
+    print(runs.sort_values("test_macro_f1", ascending=False)[cols].head(26).to_string(index=False))
 
 
 if __name__ == "__main__":

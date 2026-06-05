@@ -1,0 +1,85 @@
+# Nemotron-only shared_only subset experiment.
+# The shared neuron intersection changes by subset, while MLP training/evaluation always use all six languages.
+
+seed: 42
+output_root: outputs/nemotron_primary
+cache_dir: null
+max_length: 512
+val_ratio_if_no_validation: 0.2
+test_ratio_if_no_test: 0.1
+
+# Six Nemotron languages used for every downstream train/evaluation split.
+languages: [en, fr, ko, ja, zh, hi]
+require_all_languages_each_split: true
+
+# Exactly 26 shared_only subsets:
+#   15 all-pairs + 4 interpretable triples + 6 leave-one-out sets + 1 all-language set.
+shared_only_subset_plan:
+  all_pairs: true
+  triples:
+    - [en, fr, hi]
+    - [ja, ko, zh]
+    - [en, ko, zh]
+    - [fr, ja, hi]
+  leave_one_out: true
+  include_all: true
+  expected_count: 26
+
+# Kept for backward compatibility; subset shared_only runs override this with subset size.
+shared_min_langs: 6
+route_unknown_lang_to: en
+label_positive_is_unsafe: true
+
+# layer_values.csv is redundant across 26 runs and very large; feature manifests still preserve per-layer counts.
+save_layer_values: false
+
+# Avoid the old min-group balancing collapse. We cap large source/lang/label groups
+# and drop extremely small groups only if they fall below this threshold.
+balance_per_dataset: false
+sampling_strategy: cap
+sampling_by: [source_dataset, lang, label]
+drop_groups_below_min_n: true
+min_samples_per_group: 500
+max_samples_per_group: 5000
+max_samples_per_dataset_split: null
+
+probe:
+  # Keep SIREN-style C values for comparability.
+  c_values: [200.0, 500.0, 1000.0]
+  metric: f1_macro
+
+mlp:
+  n_trials: 32
+  n_folds: 5
+  batch_size: 8192
+  epochs_final: 512
+  early_stopping_patience: 10
+  weight_decay: 0.0001
+  hidden_layers_min: 2
+  hidden_layers_max: 3
+  hidden_dim_min: 64
+  hidden_dim_max: 2048
+  dropout_min: 0.2
+  dropout_max: 0.5
+  lr_min: 0.0001
+  lr_max: 0.005
+
+latency:
+  repeats: 5
+  warmup: 2
+  batch_size: 2048
+  max_samples: 5000
+
+datasets:
+  - name: nemotron_v3_prompt
+    enabled: true
+    source: hf
+    hf_id: nvidia/Nemotron-Safety-Guard-Dataset-v3
+    split_map: {train: train, validation: validation, test: test}
+    lang_candidates: [language, lang, locale]
+    keep_langs: [en, fr, ko, ja, zh, hi]
+    text_candidates: [prompt, text, instruction, query]
+    label_candidates: [prompt_label, label, safety_label, unsafe]
+    unsafe_values: [unsafe, harmful, 1, "1", true, True]
+    safe_values: [safe, harmless, 0, "0", false, False]
+    category_candidates: [category, prompt_category, risk_category, harm_category, taxonomy]

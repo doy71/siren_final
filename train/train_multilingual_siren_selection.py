@@ -2,6 +2,7 @@
 import argparse
 import json
 import hashlib
+import itertools
 import os
 import pickle
 import random
@@ -159,13 +160,53 @@ def dataset_signature_from_reps(all_reps: Dict[str, Dict[str, Any]]) -> Dict[str
 # Model / representation extraction
 # -----------------------------
 
-def get_extractor_class():
+MODEL_ALIASES = {
+    # Common shorthand used in earlier experiment scripts.  Official SIREN's
+    # MODEL_CONFIGS key is llama3.1-8b.
+    "llama3-8b": "llama3.1-8b",
+    "llama-3.1-8b": "llama3.1-8b",
+}
+
+
+def resolve_model_name(model_name: str) -> str:
+    """Resolve a requested model key against official SIREN MODEL_CONFIGS."""
+    requested = str(model_name)
+    if requested in MODEL_CONFIGS:
+        return requested
+    candidate = MODEL_ALIASES.get(requested, requested)
+    if candidate in MODEL_CONFIGS:
+        if candidate != requested:
+            print(f"[MODEL] alias {requested!r} -> {candidate!r}")
+        return candidate
+
+    # Also tolerate punctuation-only differences in model keys.
+    normalized = "".join(ch for ch in candidate.lower() if ch.isalnum())
+    matches = [k for k in MODEL_CONFIGS if "".join(ch for ch in str(k).lower() if ch.isalnum()) == normalized]
+    if len(matches) == 1:
+        print(f"[MODEL] normalized alias {requested!r} -> {matches[0]!r}")
+        return str(matches[0])
+
+    available = ", ".join(sorted(str(k) for k in MODEL_CONFIGS))
+    raise KeyError(f"Unknown model key {requested!r}. Available MODEL_CONFIGS keys: {available}")
+
+
+def get_extractor_class(model_name: str):
     if model_hooks is None:
         raise RuntimeError("Cannot import utils.model_hooks from official SIREN repo.")
-    # Prefer the official class used in train_general_siren.py.
-    if hasattr(model_hooks, "Qwen3RepresentationExtractor"):
-        return getattr(model_hooks, "Qwen3RepresentationExtractor")
-    # Fallback: any class with RepresentationExtractor suffix.
+
+    model_type = str(MODEL_CONFIGS[model_name].get("model_type", "")).lower()
+    candidates = []
+    if "llama" in model_type or "llama" in model_name.lower():
+        candidates.extend(["LlamaRepresentationExtractor", "Llama3RepresentationExtractor"])
+    if "qwen" in model_type or "qwen" in model_name.lower():
+        candidates.append("Qwen3RepresentationExtractor")
+    # Official model_hooks aliases LlamaRepresentationExtractor to the generic
+    # Qwen3RepresentationExtractor implementation, so this is a safe fallback.
+    candidates.extend(["Qwen3RepresentationExtractor", "LlamaRepresentationExtractor"])
+
+    for name in candidates:
+        if hasattr(model_hooks, name):
+            return getattr(model_hooks, name)
     for name in dir(model_hooks):
         if name.endswith("RepresentationExtractor"):
             return getattr(model_hooks, name)
@@ -174,7 +215,7 @@ def get_extractor_class():
 
 def build_extractor(model_name: str, device: str, batch_size: int, rep_types: Sequence[str]):
     cfg = MODEL_CONFIGS[model_name]
-    extractor_cls = get_extractor_class()
+    extractor_cls = get_extractor_class(model_name)
     model_path = cfg.get("model_path") or cfg.get("hf_id") or cfg.get("path")
     if model_path is None:
         raise KeyError(f"MODEL_CONFIGS[{model_name!r}] must contain model_path/hf_id/path")
@@ -612,6 +653,82 @@ class FeatureSpec:
         }
 
 
+def language_subset_slug(languages: Sequence[str]) -> str:
+    return "-".join(str(x) for x in languages)
+
+
+def normalize_language_subset(subset: Sequence[str], languages: Sequence[str]) -> List[str]:
+    """Validate a subset and return it in the experiment's canonical language order."""
+    all_languages = [str(x) for x in languages]
+    requested = [str(x) for x in subset]
+    if len(requested) < 2:
+        raise ValueError(f"shared_only subset must contain at least two languages: {requested}")
+    if len(set(requested)) != len(requested):
+        raise ValueError(f"shared_only subset contains duplicates: {requested}")
+    unknown = sorted(set(requested) - set(all_languages))
+    if unknown:
+        raise ValueError(f"shared_only subset contains unknown languages {unknown}; configured={all_languages}")
+    return [lang for lang in all_languages if lang in set(requested)]
+
+
+def resolve_shared_only_subsets(config: Dict[str, Any], languages: Sequence[str]) -> List[List[str]]:
+    """Build the configured shared-only subset experiment plan.
+
+    Supported forms:
+      shared_only_subsets: [[en, fr], ...]
+    or
+      shared_only_subset_plan:
+        all_pairs: true
+        triples: [[en, fr, hi], ...]
+        leave_one_out: true
+        include_all: true
+        expected_count: 26
+    """
+    all_languages = [str(x) for x in languages]
+    explicit = config.get("shared_only_subsets")
+    plan = config.get("shared_only_subset_plan") or {}
+    raw_subsets: List[Sequence[str]] = []
+
+    if explicit:
+        raw_subsets.extend(explicit)
+    elif plan:
+        if bool(plan.get("all_pairs", False)):
+            raw_subsets.extend(list(itertools.combinations(all_languages, 2)))
+        raw_subsets.extend(plan.get("triples") or [])
+        if bool(plan.get("leave_one_out", False)):
+            raw_subsets.extend([[lang for lang in all_languages if lang != excluded] for excluded in all_languages])
+        if bool(plan.get("include_all", False)):
+            raw_subsets.append(list(all_languages))
+    else:
+        # Backward-compatible original behavior: one shared set over all languages.
+        raw_subsets.append(list(all_languages))
+
+    subsets: List[List[str]] = []
+    seen = set()
+    for raw in raw_subsets:
+        normalized = normalize_language_subset(raw, all_languages)
+        key = tuple(normalized)
+        if key not in seen:
+            seen.add(key)
+            subsets.append(normalized)
+
+    expected = plan.get("expected_count", config.get("expected_shared_only_subset_count"))
+    if expected is not None and len(subsets) != int(expected):
+        raise ValueError(f"Expected {int(expected)} unique shared_only subsets, generated {len(subsets)}")
+    return subsets
+
+
+def shared_subset_metadata(shared_languages: Sequence[str], all_languages: Sequence[str]) -> Dict[str, Any]:
+    shared = [str(x) for x in shared_languages]
+    all_langs = [str(x) for x in all_languages]
+    return {
+        "selection_languages": shared,
+        "selection_langs": language_subset_slug(shared),
+        "n_selection_languages": len(shared),
+        "excluded_languages": [x for x in all_langs if x not in set(shared)],
+    }
+
+
 def build_feature_manifest(
     method: str,
     global_selected: Dict[int, List[int]],
@@ -622,6 +739,7 @@ def build_feature_manifest(
     hidden_size_by_layer: Dict[int, int],
     shared_min_langs: int,
     seed: int,
+    shared_languages: Optional[Sequence[str]] = None,
 ) -> List[FeatureSpec]:
     rng = np.random.default_rng(seed)
     features: List[FeatureSpec] = []
@@ -632,12 +750,14 @@ def build_feature_manifest(
                 features.append(FeatureSpec(layer, n, pooling_type, "global", None))
         return features
 
-    # Compute shared and lang-specific from language probes.
+    # Compute shared neurons using only the requested subset.  The downstream
+    # probe still trains/evaluates on every configured language.
+    shared_languages = list(shared_languages) if shared_languages is not None else list(languages)
     shared_by_layer: Dict[int, set] = {}
     specific_by_layer_lang: Dict[Tuple[int, str], set] = {}
     for layer in range(num_layers):
         counts = {}
-        for lang in languages:
+        for lang in shared_languages:
             for n in set(lang_selected.get(lang, {}).get(layer, [])):
                 counts[n] = counts.get(n, 0) + 1
         shared = {n for n, c in counts.items() if c >= shared_min_langs}
@@ -1023,50 +1143,91 @@ def run_method(
     method: str, threshold: float, pooling_type: str, seed: int,
     all_reps: Dict[str, Dict[str, Any]], global_probes: Dict[str, Any], lang_probes: Dict[str, Dict[str, Any]],
     config: Dict[str, Any], model_name: str, out_dir: str, device: torch.device,
+    shared_languages: Optional[Sequence[str]] = None,
+    force_rerun: bool = False,
 ) -> None:
     set_seed(seed)
     languages = [str(x) for x in config.get("languages", sorted(set(all_reps["train"]["langs"])))]
+    if method == "shared_only":
+        selection_languages = normalize_language_subset(shared_languages or languages, languages)
+    else:
+        if shared_languages is not None:
+            raise ValueError(f"shared_languages is only valid for shared_only, got method={method}")
+        selection_languages = list(languages)
+    subset_meta = shared_subset_metadata(selection_languages, languages)
+
+    run_parts = [out_dir, f"method={method}"]
+    if method == "shared_only":
+        run_parts.append(f"selection_langs={subset_meta['selection_langs']}")
+    run_parts.extend([f"threshold={threshold}", f"pooling={pooling_type}", f"seed={seed}"])
+    run_dir = os.path.join(*run_parts)
+    os.makedirs(run_dir, exist_ok=True)
+
+    complete_files = ["metrics.json", "best_model.pkl", "feature_manifest.json", "predictions.jsonl", "selected_neurons.json"]
+    if bool(config.get("save_layer_values", True)):
+        complete_files.append("layer_values.csv")
+    is_complete = all(os.path.exists(os.path.join(run_dir, x)) for x in complete_files)
+    skipped_path = os.path.join(run_dir, "skipped.json")
+    is_skipped = os.path.exists(skipped_path)
+    if (is_complete or is_skipped) and not force_rerun:
+        state = "complete" if is_complete else "previously skipped"
+        print(f"[RESUME] skip {state} run: {run_dir}")
+        return
+    if force_rerun and is_skipped:
+        os.remove(skipped_path)
+
     num_layers = int(all_reps["train"]["num_layers"])
     layer_weights = get_layer_weights(global_probes, pooling_type, num_layers)
-
-    # Read eps_weight_ratio from config for neuron selection denoising.
-    # Set probe.eps_weight_ratio: 1e-3 in config when selection ratios are >50%.
     eps_weight_ratio = float(config.get("probe", {}).get("eps_weight_ratio", 0.0))
 
-    print(f"\n[SELECT] {method} threshold={threshold} pooling={pooling_type} seed={seed}")
+    print(
+        f"\n[SELECT] {method} threshold={threshold} pooling={pooling_type} seed={seed} "
+        f"selection_langs={subset_meta['selection_langs']}"
+    )
 
-    # Compute only the selection sets required by the current method.
-    # This prevents siren_original logs from being polluted by language-probe warnings
-    # and avoids unnecessary language-selection work when reproducing the original SIREN baseline.
     if method == "siren_original":
         global_sel = selected_global(global_probes, pooling_type, threshold, num_layers, eps_weight_ratio)
         lang_sel = {}
     else:
         global_sel = {}
-        lang_sel = selected_by_language(lang_probes, languages, pooling_type, threshold, num_layers, eps_weight_ratio)
+        # For subset shared_only, only these language probe selections determine
+        # the intersection.  Training/evaluation data remain all six languages.
+        probe_languages = selection_languages if method == "shared_only" else languages
+        lang_sel = selected_by_language(lang_probes, probe_languages, pooling_type, threshold, num_layers, eps_weight_ratio)
+
     hidden_size_by_layer = infer_hidden_size_by_layer(all_reps["train"]["representations"], pooling_type, num_layers)
+    shared_min_langs = len(selection_languages) if method == "shared_only" else int(config.get("shared_min_langs", len(languages)))
     features = build_feature_manifest(
         method, global_sel, lang_sel, languages, pooling_type, num_layers, hidden_size_by_layer,
-        int(config.get("shared_min_langs", len(languages))), seed,
+        shared_min_langs, seed, shared_languages=selection_languages if method == "shared_only" else None,
     )
     if len(features) == 0:
-        print(f"[WARN] no features selected for {method} threshold={threshold} pooling={pooling_type}; skip")
+        skipped = {
+            "reason": "no_features_selected",
+            "model": model_name,
+            "method": method,
+            "threshold": threshold,
+            "pooling_type": pooling_type,
+            "seed": seed,
+            **subset_meta,
+        }
+        with open(os.path.join(run_dir, "skipped.json"), "w", encoding="utf-8") as f:
+            json.dump(skipped, f, indent=2, ensure_ascii=False)
+        print(f"[WARN] no features selected; recorded skip: {run_dir}")
         return
 
-    # Warn when total feature dimension is very large — MLP training will be slow/OOM.
     total_neurons = sum(hidden_size_by_layer.values())
     if total_neurons > 0 and len(features) > 0.5 * total_neurons:
         print(
             f"[WARN-DIM] {method} threshold={threshold}: {len(features)} features "
             f"= {len(features)/total_neurons:.1%} of total neuron budget ({total_neurons}). "
-            "High selection ratio detected. "
-            "Consider probe.eps_weight_ratio or lower probe.c_values to reduce feature count."
+            "High selection ratio detected. Consider probe.eps_weight_ratio or lower probe.c_values."
         )
 
-    run_dir = os.path.join(out_dir, f"method={method}", f"threshold={threshold}", f"pooling={pooling_type}", f"seed={seed}")
-    os.makedirs(run_dir, exist_ok=True)
-
-    print(f"\n[RUN] {method} threshold={threshold} pooling={pooling_type} seed={seed} dim={len(features)}")
+    print(
+        f"\n[RUN] {method} threshold={threshold} pooling={pooling_type} seed={seed} "
+        f"selection_langs={subset_meta['selection_langs']} dim={len(features)}"
+    )
     route_fallback = config.get("route_unknown_lang_to")
     X_train = aggregate_features(all_reps["train"]["representations"], all_reps["train"]["langs"], features, layer_weights, method, route_fallback)
     X_val = aggregate_features(all_reps["validation"]["representations"], all_reps["validation"]["langs"], features, layer_weights, method, route_fallback)
@@ -1076,19 +1237,13 @@ def run_method(
     train_ds_ids = dataset_ids_from_sources(all_reps["train"]["source_datasets"], source_vocab)
     val_ds_ids = dataset_ids_from_sources(all_reps["validation"]["source_datasets"], source_vocab)
 
-    # SIREN-style Optuna CV. Search on train+val, final model still monitored on validation for stable early stopping.
     X_cv = np.vstack([X_train, X_val])
     y_cv = np.concatenate([all_reps["train"]["labels"], all_reps["validation"]["labels"]])
     ds_cv = np.concatenate([train_ds_ids, val_ds_ids])
     mlp_cfg = dict(config["mlp"])
     mlp_cfg["n_folds"] = int(config["mlp"].get("n_folds", 3))
     params, cv_f1 = search_mlp_params(X_cv, y_cv, ds_cv, device, mlp_cfg, seed)
-    # Official: train final model on X_train+X_val merged, 512 epochs, no early stopping.
-    # FIX: was passing only X_train with val monitoring — now matches official exactly.
-    model, best_val_f1 = train_final_mlp(
-        X_cv, y_cv,
-        params, device, mlp_cfg, cv_f1,
-    )
+    model, best_val_f1 = train_final_mlp(X_cv, y_cv, params, device, mlp_cfg, cv_f1)
 
     pred_test, score_test = predict_scores(model, X_test, device)
     pred_train, score_train = predict_scores(model, X_train, device)
@@ -1106,6 +1261,8 @@ def run_method(
             "pred": preds.astype(int),
             "score": scores.astype(float),
             "method": method,
+            "selection_langs": subset_meta["selection_langs"],
+            "n_selection_languages": subset_meta["n_selection_languages"],
             "threshold": threshold,
             "pooling_type": pooling_type,
             "seed": seed,
@@ -1122,6 +1279,7 @@ def run_method(
     metrics = {
         "model": model_name,
         "method": method,
+        **subset_meta,
         "threshold": threshold,
         "pooling_type": pooling_type,
         "seed": seed,
@@ -1137,7 +1295,6 @@ def run_method(
     with open(os.path.join(run_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
 
-    # Save model and feature metadata.
     with open(os.path.join(run_dir, "best_model.pkl"), "wb") as f:
         pickle.dump({
             "model_state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
@@ -1145,6 +1302,7 @@ def run_method(
             "feature_dim": len(features),
             "best_params": params,
             "method": method,
+            **subset_meta,
             "threshold": threshold,
             "pooling_type": pooling_type,
             "layer_weights": layer_weights,
@@ -1158,26 +1316,29 @@ def run_method(
         "global_selected": {str(k): v for k, v in global_sel.items()},
         "lang_selected": {lang: {str(k): v for k, v in layers.items()} for lang, layers in lang_sel.items()},
         "layer_weights": {str(k): float(v) for k, v in layer_weights.items()},
-        "shared_min_langs": int(config.get("shared_min_langs", len(languages))),
+        "shared_min_langs": int(shared_min_langs),
+        **subset_meta,
         "active_feature_counts": active_feature_counts(features, languages),
         "selection_debug": collect_selection_debug(
-            global_probes, lang_probes, languages, pooling_type, threshold, num_layers,
-            eps_weight_ratio,
+            global_probes, lang_probes, selection_languages if method == "shared_only" else languages,
+            pooling_type, threshold, num_layers, eps_weight_ratio,
         ),
     }
     with open(os.path.join(run_dir, "selected_neurons.json"), "w", encoding="utf-8") as f:
         json.dump(selected_summary, f, indent=2, ensure_ascii=False)
 
-    lv = compute_layer_values(
-        all_reps["test"]["representations"], all_reps["test"]["labels"], all_reps["test"]["langs"],
-        all_reps["test"]["source_datasets"], all_reps["test"]["source_ids"], features, layer_weights, method,
-        threshold, route_fallback,
-    )
-    lv.to_csv(os.path.join(run_dir, "layer_values.csv"), index=False)
+    if bool(config.get("save_layer_values", True)):
+        lv = compute_layer_values(
+            all_reps["test"]["representations"], all_reps["test"]["labels"], all_reps["test"]["langs"],
+            all_reps["test"]["source_datasets"], all_reps["test"]["source_ids"], features, layer_weights, method,
+            threshold, route_fallback,
+        )
+        lv["selection_langs"] = subset_meta["selection_langs"]
+        lv["n_selection_languages"] = subset_meta["n_selection_languages"]
+        lv.to_csv(os.path.join(run_dir, "layer_values.csv"), index=False)
 
     print(f"[DONE] {run_dir}")
     print(json.dumps(metrics["overall_test"], indent=2))
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1191,9 +1352,11 @@ def main():
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--n_trials", type=int, default=None)
     parser.add_argument("--n_folds", type=int, default=None)
+    parser.add_argument("--shared_subset_filter", nargs="+", default=None, help="Optional selection_langs slugs to run, e.g. en-fr ko-ja-zh")
     parser.add_argument("--skip_failed_datasets", action="store_true")
     parser.add_argument("--force_reextract", action="store_true")
     parser.add_argument("--force_retrain_probes", action="store_true")
+    parser.add_argument("--force_rerun_methods", action="store_true")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -1203,13 +1366,32 @@ def main():
     if args.n_folds is not None:
         config["mlp"]["n_folds"] = args.n_folds
     seeds = args.seeds if args.seeds is not None else [int(config.get("seed", 42))]
+    model_name = resolve_model_name(args.model)
 
     set_seed(seeds[0])
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
-    out_dir = os.path.join(config.get("output_root", "outputs/multilingual_siren"), args.model)
+    out_dir = os.path.join(config.get("output_root", "outputs/multilingual_siren"), model_name)
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "resolved_config.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False, allow_unicode=True)
+
+    languages = [str(x) for x in config.get("languages", [])]
+    all_shared_subsets = resolve_shared_only_subsets(config, languages) if "shared_only" in args.methods else []
+    subset_manifest = [shared_subset_metadata(s, languages) for s in all_shared_subsets]
+    if all_shared_subsets:
+        with open(os.path.join(out_dir, "shared_only_subset_manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(subset_manifest, f, indent=2, ensure_ascii=False)
+
+    shared_subsets = list(all_shared_subsets)
+    if args.shared_subset_filter:
+        requested = set(str(x) for x in args.shared_subset_filter)
+        shared_subsets = [s for s in all_shared_subsets if language_subset_slug(s) in requested]
+        missing = requested - {language_subset_slug(s) for s in shared_subsets}
+        if missing:
+            raise ValueError(f"shared_subset_filter did not match configured subsets: {sorted(missing)}")
+    if all_shared_subsets:
+        planned_counts = {n: sum(1 for s in all_shared_subsets if len(s) == n) for n in sorted({len(s) for s in all_shared_subsets})}
+        print(f"[SUBSETS] planned={len(all_shared_subsets)} by_size={planned_counts}; executing={len(shared_subsets)}")
 
     print("\n[1] Build normalized dataset")
     dfs = build_normalized_dataset(config, skip_failed=args.skip_failed_datasets)
@@ -1217,18 +1399,28 @@ def main():
         print(f"{split:10s}: {len(df):7d} | langs={sorted(df['lang'].unique().tolist()) if len(df) else []}")
     save_dataset_artifacts(dfs, out_dir)
 
+    if bool(config.get("require_all_languages_each_split", False)):
+        missing_by_split = {}
+        for split, df in dfs.items():
+            observed = set(df["lang"].astype(str).tolist()) if len(df) else set()
+            missing = [x for x in languages if x not in observed]
+            if missing:
+                missing_by_split[split] = missing
+        if missing_by_split:
+            raise ValueError(f"Configured languages missing from normalized split(s): {missing_by_split}")
+
     print("\n[2] Extract SIREN representations")
     dataset_sig = dataset_signature_from_dfs(dfs)
     with open(os.path.join(out_dir, "dataset_signature.json"), "w", encoding="utf-8") as f:
         json.dump(dataset_sig, f, indent=2, ensure_ascii=False)
     all_reps = extract_representations(
-        args.model, dfs, str(device), args.batch_size, args.pooling_types, out_dir,
+        model_name, dfs, str(device), args.batch_size, args.pooling_types, out_dir,
         force_reextract=args.force_reextract, dataset_signature=dataset_sig,
     )
 
     print("\n[3] Train global and language-specific SIREN probes")
     global_probes, lang_probes = train_all_probes(
-        all_reps, config.get("languages", []), config["probe"]["c_values"], args.pooling_types,
+        all_reps, languages, config["probe"]["c_values"], args.pooling_types,
         str(device), out_dir, metric=config["probe"].get("metric", "f1_macro"), force_retrain=args.force_retrain_probes,
     )
 
@@ -1237,7 +1429,18 @@ def main():
         for pooling_type in args.pooling_types:
             for threshold in args.thresholds:
                 for method in args.methods:
-                    run_method(method, threshold, pooling_type, seed, all_reps, global_probes, lang_probes, config, args.model, out_dir, device)
+                    if method == "shared_only":
+                        for subset in shared_subsets:
+                            run_method(
+                                method, threshold, pooling_type, seed, all_reps, global_probes, lang_probes,
+                                config, model_name, out_dir, device, shared_languages=subset,
+                                force_rerun=args.force_rerun_methods,
+                            )
+                    else:
+                        run_method(
+                            method, threshold, pooling_type, seed, all_reps, global_probes, lang_probes,
+                            config, model_name, out_dir, device, force_rerun=args.force_rerun_methods,
+                        )
 
 
 if __name__ == "__main__":
