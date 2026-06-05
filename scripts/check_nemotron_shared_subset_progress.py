@@ -57,7 +57,7 @@ def main() -> None:
     p.add_argument("--config", default="configs/exp_nemotron_shared_subsets.yaml")
     p.add_argument("--root", default="outputs/nemotron_primary")
     p.add_argument("--models", nargs="+", default=["qwen3-4b", "llama3.1-8b"])
-    p.add_argument("--threshold", type=float, default=0.9)
+    p.add_argument("--threshold", type=float, default=0.6)
     p.add_argument("--pooling", default="residual_mean")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_csv", default=None)

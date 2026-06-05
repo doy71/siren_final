@@ -13,8 +13,10 @@ BATCH_SIZE=${BATCH_SIZE:-32}
 N_TRIALS=${N_TRIALS:-32}
 N_FOLDS=${N_FOLDS:-5}
 SEEDS=${SEEDS:-42}
-POOLING_TYPES=${POOLING_TYPES:-"residual_mean"}
-THRESHOLDS=${THRESHOLDS:-"0.9"}
+# Fixed by experiment design: run only threshold=0.6 with residual_mean pooling.
+# These are intentionally not environment-overridable to prevent accidental mixed-condition runs.
+POOLING_TYPES="residual_mean"
+THRESHOLDS="0.6"
 
 VALIDATE_DATASET=${VALIDATE_DATASET:-1}
 FORCE_REEXTRACT=${FORCE_REEXTRACT:-0}
@@ -73,7 +75,9 @@ for MODEL in ${MODELS}; do
   OUT_ROOT="outputs/nemotron_primary/${RESOLVED_MODEL}"
   python analysis/analyze_multilingual_siren_results.py \
     --run_dir "${OUT_ROOT}" \
-    --out_dir "${OUT_ROOT}/analysis_shared_subsets"
+    --out_dir "${OUT_ROOT}/analysis_shared_subsets" \
+    --thresholds ${THRESHOLDS} \
+    --pooling_types ${POOLING_TYPES}
 done
 
 echo ""

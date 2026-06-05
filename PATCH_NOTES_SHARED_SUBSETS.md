@@ -7,6 +7,7 @@
   - uses only Nemotron
   - disables large redundant `layer_values.csv` by default
 - `scripts/run_nemotron_shared_subsets.sh`
+  - fixes the experiment condition to `threshold=0.6` and `pooling=residual_mean` only
   - runs both `qwen3-4b` and `llama3.1-8b`
   - does not run Lumees/external validation
   - reuses representation/probe caches and resumes completed subset runs
@@ -23,6 +24,7 @@
   - supports `llama3-8b` alias and model-aware extractor selection
   - adds method-level resume behavior
 - `analysis/analyze_multilingual_siren_results.py`
+  - supports threshold/pooling filters so old 0.9 outputs are not mixed into the 0.6 analysis
   - reads nested subset run paths
   - creates subset-size and language-inclusion summaries/plots
   - deduplicates a legacy all-language `shared_only` run when a new explicit subset run exists

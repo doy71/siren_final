@@ -23,12 +23,14 @@ Defaults:
 
 - Qwen: `qwen3-4b`
 - Llama: `llama3.1-8b`
-- threshold: `0.9`
-- pooling: `residual_mean`
+- threshold: `0.6` only
+- pooling: `residual_mean` only
 - one seed: `42`
 - existing Nemotron representations and probes are reused when cache metadata matches
 - completed subset runs are skipped automatically
 - no Lumees or other external dataset is loaded
+
+The shared-subset run script intentionally fixes these two conditions and ignores `THRESHOLDS` or `POOLING_TYPES` environment variables, preventing accidental 0.9/MLP runs. Existing `threshold=0.9` output folders may be kept; the automatic analysis command filters them out.
 
 Run one model only:
 
@@ -58,7 +60,7 @@ outputs/nemotron_primary/{model}/
   shared_only_subset_manifest.json
   method=shared_only/
     selection_langs=en-fr/
-      threshold=0.9/pooling=residual_mean/seed=42/
+      threshold=0.6/pooling=residual_mean/seed=42/
         metrics.json
         predictions.jsonl
         selected_neurons.json

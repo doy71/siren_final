@@ -312,6 +312,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run_dir", required=True)
     p.add_argument("--out_dir", required=True)
+    p.add_argument("--thresholds", nargs="+", type=float, default=None,
+                   help="Optional thresholds to include, e.g. --thresholds 0.6")
+    p.add_argument("--pooling_types", nargs="+", default=None,
+                   help="Optional pooling types to include, e.g. --pooling_types residual_mean")
     args = p.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -321,6 +325,19 @@ def main():
     runs = load_runs(args.run_dir)
     if len(runs) == 0:
         raise FileNotFoundError(f"No metrics.json found under {args.run_dir}")
+    if args.thresholds is not None:
+        numeric_thresholds = pd.to_numeric(runs["threshold"], errors="coerce")
+        mask = np.zeros(len(runs), dtype=bool)
+        for threshold in args.thresholds:
+            mask |= np.isclose(numeric_thresholds.to_numpy(dtype=float), float(threshold), equal_nan=False)
+        runs = runs[mask].copy()
+    if args.pooling_types is not None:
+        runs = runs[runs["pooling_type"].astype(str).isin([str(x) for x in args.pooling_types])].copy()
+    if len(runs) == 0:
+        raise FileNotFoundError(
+            f"No runs remain after threshold/pooling filters under {args.run_dir}: "
+            f"thresholds={args.thresholds}, pooling_types={args.pooling_types}"
+        )
     # Prefer the new explicit subset-path run over a legacy all-language
     # shared_only run when both describe the same experiment key.
     dedupe_keys = ["model", "method", "selection_langs", "threshold", "pooling_type", "seed"]

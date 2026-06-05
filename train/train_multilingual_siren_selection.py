@@ -1378,9 +1378,8 @@ def main():
     languages = [str(x) for x in config.get("languages", [])]
     all_shared_subsets = resolve_shared_only_subsets(config, languages) if "shared_only" in args.methods else []
     subset_manifest = [shared_subset_metadata(s, languages) for s in all_shared_subsets]
-    if all_shared_subsets:
-        with open(os.path.join(out_dir, "shared_only_subset_manifest.json"), "w", encoding="utf-8") as f:
-            json.dump(subset_manifest, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(out_dir, "shared_only_subset_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(subset_manifest, f, indent=2, ensure_ascii=False)
 
     shared_subsets = list(all_shared_subsets)
     if args.shared_subset_filter:
